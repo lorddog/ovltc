@@ -1,0 +1,15 @@
+LIBRARY ovl_wcx.wcx64
+EXPORTS
+    OpenArchiveW
+    ReadHeaderExW
+    ProcessFileW
+    CloseArchive
+    SetChangeVolProcW
+    SetProcessDataProcW
+    GetPackerCaps
+    OpenArchive
+    ReadHeader
+    ReadHeaderEx
+    ProcessFile
+    SetChangeVolProc
+    PackFiles

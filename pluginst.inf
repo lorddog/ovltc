@@ -1,0 +1,6 @@
+[plugininstall]
+type=wcx
+file=ovl_wcx.wcx64
+defaultdir=OVL
+defaultextension=ovl
+description=OVL/FRES archive (Cobra Engine)

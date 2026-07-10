@@ -1,0 +1,19 @@
+# Build-Ausgaben
+build/
+*.obj
+*.lib
+*.exp
+*.wcx64
+*.wcx
+*.exe
+*.pdb
+*.ilk
+
+# Python
+__pycache__/
+*.pyc
+
+# Editor/OS
+.vs/
+*.user
+Thumbs.db
