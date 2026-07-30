@@ -744,6 +744,313 @@ static uint64_t resolve_xmlconfig(growbuf_t *out, const unsigned char *decomp, s
     return start_off;
 }
 
+/* ---------------------------------------------------------------------------
+ * Generic best-effort dump for unknown structured-data resource types
+ *
+ * For resource types with no known field schema (e.g. presets/games other
+ * than the JWE2 "Casino:*" set this plugin has dedicated resolvers for),
+ * there is no way to reproduce an official/exact XML shape. Instead of a
+ * meaningless raw-byte stub, the pointer graph is resolved generically via
+ * the same Fragment table used by the dedicated resolvers above, and
+ * rendered as readable, self-invented pseudo-XML -- no claim of matching any
+ * real engine schema, just best-effort readability (see unpack_ovl.py's
+ * resolve_generic_structured for the equivalent Python implementation).
+ * ------------------------------------------------------------------------- */
+
+typedef struct { int32_t pool; uint32_t offset; } pool_boundary_t;
+
+static int cmp_pool_boundary(const void *a, const void *b) {
+    const pool_boundary_t *ba = (const pool_boundary_t *)a;
+    const pool_boundary_t *bb = (const pool_boundary_t *)b;
+    if (ba->pool != bb->pool) return (ba->pool > bb->pool) - (ba->pool < bb->pool);
+    return (ba->offset > bb->offset) - (ba->offset < bb->offset);
+}
+
+/* Sorted list of every known offset (from RootEntry.data_offset AND
+   Fragment.struct_offset) per pool -- lets struct_size_at_generic determine
+   the size of ANY struct location reached via a pointer chain, not just
+   root-level entries (generalizes the same boundary-diff idea used
+   throughout this file). */
+static pool_boundary_t *build_pool_boundaries(const ovl_root_entry_t *root_entries, int root_count,
+                                               const ovl_fragment_t *fragments, int frag_count,
+                                               int *out_count) {
+    int cap = root_count + frag_count;
+    if (cap <= 0) { *out_count = 0; return NULL; }
+    pool_boundary_t *arr = (pool_boundary_t *)malloc(sizeof(pool_boundary_t) * (size_t)cap);
+    if (!arr) { *out_count = 0; return NULL; }
+    int n = 0;
+    for (int i = 0; i < root_count; i++) { arr[n].pool = root_entries[i].pool_index; arr[n].offset = root_entries[i].data_offset; n++; }
+    for (int i = 0; i < frag_count; i++) { arr[n].pool = fragments[i].struct_pool; arr[n].offset = fragments[i].struct_offset; n++; }
+    qsort(arr, (size_t)n, sizeof(pool_boundary_t), cmp_pool_boundary);
+    *out_count = n;
+    return arr;
+}
+
+static uint32_t struct_size_at_generic(const pool_boundary_t *bounds, int bounds_count,
+                                        const ovl_pool_t *pools, int pool_count,
+                                        int32_t pool_index, uint32_t offset) {
+    if (pool_index < 0 || pool_index >= pool_count) return 0;
+    uint32_t pool_size = pools[pool_index].size;
+    pool_boundary_t target = { pool_index, offset };
+    int lo = 0, hi = bounds_count;
+    while (lo < hi) {
+        int mid = lo + (hi - lo) / 2;
+        if (cmp_pool_boundary(&bounds[mid], &target) <= 0) lo = mid + 1; else hi = mid;
+    }
+    uint32_t next_off = pool_size;
+    if (lo < bounds_count && bounds[lo].pool == pool_index && bounds[lo].offset < next_off) next_off = bounds[lo].offset;
+    return (next_off > offset) ? (next_off - offset) : 0;
+}
+
+#define GENERIC_MAX_DEPTH 4
+#define GENERIC_MAX_ARRAY 256
+#define GENERIC_MAX_VISITED 512
+
+typedef enum { GV_RAW, GV_STR, GV_ARRAY, GV_STRUCT } generic_kind_t;
+typedef struct generic_val {
+    generic_kind_t kind;
+    uint32_t raw;
+    char *str;                     /* GV_STR: malloc'd */
+    struct generic_val *children;  /* GV_ARRAY/GV_STRUCT: malloc'd array */
+    int child_count;
+} generic_val_t;
+
+static void generic_val_free(generic_val_t *v) {
+    if (!v) return;
+    free(v->str);
+    for (int i = 0; i < v->child_count; i++) generic_val_free(&v->children[i]);
+    free(v->children);
+}
+
+static int visited_contains(const pool_boundary_t *v, int n, int32_t pool, uint32_t off) {
+    for (int i = 0; i < n; i++) if (v[i].pool == pool && v[i].offset == off) return 1;
+    return 0;
+}
+
+static int looks_like_text(const char *s, size_t len) {
+    if (len == 0 || len > 512) return 0;
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (!((c >= 32 && c < 127) || c == 9 || c == 10 || c == 13)) return 0;
+    }
+    return 1;
+}
+
+static char *generic_try_string(const unsigned char *decomp, size_t decomp_size,
+                                 const ovl_pool_t *pools, int pool_count, uint32_t pool_region_start,
+                                 int32_t pool_index, uint32_t offset) {
+    size_t len;
+    const char *s = read_zstring_at(decomp, decomp_size, pools, pool_count, pool_region_start, pool_index, offset, &len);
+    if (!s || !looks_like_text(s, len)) return NULL;
+    char *out = (char *)malloc(len + 1);
+    if (!out) return NULL;
+    memcpy(out, s, len);
+    out[len] = '\0';
+    return out;
+}
+
+static void generic_push_child(generic_val_t **arr, int *count, generic_val_t v) {
+    generic_val_t *n = (generic_val_t *)realloc(*arr, sizeof(generic_val_t) * (size_t)(*count + 1));
+    if (!n) { generic_val_free(&v); return; }
+    *arr = n;
+    (*arr)[*count] = v;
+    (*count)++;
+}
+
+static generic_val_t generic_resolve_pointer(const unsigned char *decomp, size_t decomp_size,
+                                              const ovl_pool_t *pools, int pool_count, uint32_t pool_region_start,
+                                              const ovl_fragment_t *frags_sorted, int frag_count,
+                                              const pool_boundary_t *bounds, int bounds_count,
+                                              int32_t pool_index, uint32_t offset,
+                                              int depth, pool_boundary_t *visited, int visited_count);
+
+/* Reads a struct slot-by-slot: 8-byte slots with a Fragment link resolve as a
+   pointer (string / array / nested struct); everything else is read in
+   4-byte steps as an unsigned integer. */
+static void generic_resolve_struct(const unsigned char *decomp, size_t decomp_size,
+                                    const ovl_pool_t *pools, int pool_count, uint32_t pool_region_start,
+                                    const ovl_fragment_t *frags_sorted, int frag_count,
+                                    const pool_boundary_t *bounds, int bounds_count,
+                                    int32_t pool_index, uint32_t offset, uint32_t size,
+                                    int depth, pool_boundary_t *visited, int visited_count,
+                                    generic_val_t **out_children, int *out_count) {
+    *out_children = NULL;
+    *out_count = 0;
+    if (depth > GENERIC_MAX_DEPTH || size == 0 || pool_index < 0 || pool_index >= pool_count) return;
+    if (visited_contains(visited, visited_count, pool_index, offset)) return;
+    if (visited_count < GENERIC_MAX_VISITED) { visited[visited_count].pool = pool_index; visited[visited_count].offset = offset; visited_count++; }
+
+    uint32_t pool_start = pool_region_start + pools[pool_index].offset;
+    uint32_t end = offset + size;
+    uint32_t pos = offset;
+    while (pos < end) {
+        const ovl_fragment_t *link = (pos + 8 <= end) ? find_link(frags_sorted, frag_count, pool_index, pos) : NULL;
+        if (link) {
+            int32_t tpool = link->struct_pool;
+            uint32_t toff = link->struct_offset;
+            char *s = generic_try_string(decomp, decomp_size, pools, pool_count, pool_region_start, tpool, toff);
+            if (s) {
+                generic_val_t v = {0}; v.kind = GV_STR; v.str = s;
+                generic_push_child(out_children, out_count, v);
+            } else {
+                int run = 0;
+                uint32_t p = toff;
+                while (run < GENERIC_MAX_ARRAY && find_link(frags_sorted, frag_count, tpool, p)) { run++; p += 8; }
+                if (run >= 2) {
+                    generic_val_t v = {0}; v.kind = GV_ARRAY;
+                    for (int i = 0; i < run; i++) {
+                        const ovl_fragment_t *e = find_link(frags_sorted, frag_count, tpool, toff + (uint32_t)i * 8);
+                        generic_val_t item = generic_resolve_pointer(decomp, decomp_size, pools, pool_count, pool_region_start,
+                                                                      frags_sorted, frag_count, bounds, bounds_count,
+                                                                      e->struct_pool, e->struct_offset, depth + 1, visited, visited_count);
+                        generic_push_child(&v.children, &v.child_count, item);
+                    }
+                    generic_push_child(out_children, out_count, v);
+                } else {
+                    uint32_t tsize = struct_size_at_generic(bounds, bounds_count, pools, pool_count, tpool, toff);
+                    generic_val_t v = {0}; v.kind = GV_STRUCT;
+                    generic_resolve_struct(decomp, decomp_size, pools, pool_count, pool_region_start,
+                                            frags_sorted, frag_count, bounds, bounds_count,
+                                            tpool, toff, tsize, depth + 1, visited, visited_count,
+                                            &v.children, &v.child_count);
+                    generic_push_child(out_children, out_count, v);
+                }
+            }
+            pos += 8;
+        } else if (pos + 4 <= end) {
+            uint32_t val; memcpy(&val, decomp + pool_start + pos, 4);
+            generic_val_t v = {0}; v.kind = GV_RAW; v.raw = val;
+            generic_push_child(out_children, out_count, v);
+            pos += 4;
+        } else {
+            pos = end;
+        }
+    }
+}
+
+static generic_val_t generic_resolve_pointer(const unsigned char *decomp, size_t decomp_size,
+                                              const ovl_pool_t *pools, int pool_count, uint32_t pool_region_start,
+                                              const ovl_fragment_t *frags_sorted, int frag_count,
+                                              const pool_boundary_t *bounds, int bounds_count,
+                                              int32_t pool_index, uint32_t offset,
+                                              int depth, pool_boundary_t *visited, int visited_count) {
+    char *s = generic_try_string(decomp, decomp_size, pools, pool_count, pool_region_start, pool_index, offset);
+    if (s) { generic_val_t v = {0}; v.kind = GV_STR; v.str = s; return v; }
+    uint32_t size = struct_size_at_generic(bounds, bounds_count, pools, pool_count, pool_index, offset);
+    generic_val_t v = {0}; v.kind = GV_STRUCT;
+    generic_resolve_struct(decomp, decomp_size, pools, pool_count, pool_region_start,
+                            frags_sorted, frag_count, bounds, bounds_count,
+                            pool_index, offset, size, depth, visited, visited_count,
+                            &v.children, &v.child_count);
+    return v;
+}
+
+static void generic_render_slots(growbuf_t *out, const generic_val_t *slots, int count, const char *indent);
+
+static void generic_render_item(growbuf_t *out, const generic_val_t *item, const char *indent) {
+    char child_indent[64];
+    _snprintf(child_indent, sizeof(child_indent) - 1, "%s\t", indent);
+    if (item->kind == GV_STR) {
+        xml_append_str(out, indent); xml_append_str(out, "<item>");
+        xml_append_escaped(out, item->str, 0);
+        xml_append_str(out, "</item>\n");
+        return;
+    }
+    /* GV_STRUCT with exactly one string field and the rest raw ints ->
+       render compactly as attributes + text, matching the top-level
+       renderer's philosophy of keeping simple records on one line. */
+    int str_count = 0, other_count = 0, all_raw = 1;
+    const generic_val_t *the_str = NULL;
+    for (int i = 0; i < item->child_count; i++) {
+        if (item->children[i].kind == GV_STR) { str_count++; the_str = &item->children[i]; }
+        else { other_count++; if (item->children[i].kind != GV_RAW) all_raw = 0; }
+    }
+    if (item->kind == GV_STRUCT && str_count == 1 && all_raw) {
+        xml_append_str(out, indent); xml_append_str(out, "<item");
+        int attr_i = 0;
+        for (int i = 0; i < item->child_count; i++) {
+            if (item->children[i].kind != GV_RAW) continue;
+            attr_i++;
+            char buf[48];
+            _snprintf(buf, sizeof(buf) - 1, " attr%d=\"%u\"", attr_i, item->children[i].raw);
+            xml_append_str(out, buf);
+        }
+        xml_append_str(out, ">");
+        xml_append_escaped(out, the_str->str, 0);
+        xml_append_str(out, "</item>\n");
+        return;
+    }
+    xml_append_str(out, indent); xml_append_str(out, "<item>\n");
+    generic_render_slots(out, item->children, item->child_count, child_indent);
+    xml_append_str(out, indent); xml_append_str(out, "</item>\n");
+}
+
+static void generic_render_slots(growbuf_t *out, const generic_val_t *slots, int count, const char *indent) {
+    char child_indent[64];
+    _snprintf(child_indent, sizeof(child_indent) - 1, "%s\t", indent);
+    for (int i = 0; i < count; i++) {
+        const generic_val_t *v = &slots[i];
+        char tag[24];
+        _snprintf(tag, sizeof(tag) - 1, "field%d", i + 1);
+        switch (v->kind) {
+            case GV_RAW: {
+                char buf[64];
+                _snprintf(buf, sizeof(buf) - 1, "%s<%s>%u</%s>\n", indent, tag, v->raw, tag);
+                xml_append_str(out, buf);
+                break;
+            }
+            case GV_STR:
+                xml_append_str(out, indent); xml_append_str(out, "<"); xml_append_str(out, tag); xml_append_str(out, ">");
+                xml_append_escaped(out, v->str, 0);
+                xml_append_str(out, "</"); xml_append_str(out, tag); xml_append_str(out, ">\n");
+                break;
+            case GV_ARRAY: {
+                char buf[48];
+                _snprintf(buf, sizeof(buf) - 1, "%s<items count=\"%d\">\n", indent, v->child_count);
+                xml_append_str(out, buf);
+                for (int j = 0; j < v->child_count; j++) generic_render_item(out, &v->children[j], child_indent);
+                xml_append_str(out, indent); xml_append_str(out, "</items>\n");
+                break;
+            }
+            case GV_STRUCT:
+                xml_append_str(out, indent); xml_append_str(out, "<"); xml_append_str(out, tag); xml_append_str(out, ">\n");
+                generic_render_slots(out, v->children, v->child_count, child_indent);
+                xml_append_str(out, indent); xml_append_str(out, "</"); xml_append_str(out, tag); xml_append_str(out, ">\n");
+                break;
+        }
+    }
+}
+
+/* Best-effort dump for an unknown structured-data type (see module comment
+   above). type_name is the middle segment of the type string (e.g.
+   "ControlGroup" from "Project:ControlGroup:controls"). Appends to `out`
+   like resolve_worlddesc/resolve_xmlconfig; returns the start offset within
+   `out`, or (uint64_t)-1 on failure. */
+static uint64_t resolve_generic_structured(growbuf_t *out, const unsigned char *decomp, size_t decomp_size,
+                                            const ovl_pool_t *pools, int pool_count, uint32_t pool_region_start,
+                                            const ovl_fragment_t *frags_sorted, int frag_count,
+                                            const pool_boundary_t *bounds, int bounds_count,
+                                            int32_t pool_index, uint32_t data_offset, uint32_t size,
+                                            const char *type_name, const char *file_name, size_t *out_size) {
+    pool_boundary_t visited[GENERIC_MAX_VISITED];
+    generic_val_t *slots = NULL; int slot_count = 0;
+    generic_resolve_struct(decomp, decomp_size, pools, pool_count, pool_region_start,
+                            frags_sorted, frag_count, bounds, bounds_count,
+                            pool_index, data_offset, size, 0, visited, 0, &slots, &slot_count);
+
+    uint64_t start_off = out->size;
+    xml_append_str(out, "<"); xml_append_str(out, type_name); xml_append_str(out, " name=\"");
+    xml_append_escaped(out, file_name, 1);
+    xml_append_str(out, "\">\n");
+    generic_render_slots(out, slots, slot_count, "\t");
+    xml_append_str(out, "</"); xml_append_str(out, type_name); xml_append_str(out, ">\n");
+    *out_size = (size_t)(out->size - start_off);
+
+    for (int i = 0; i < slot_count; i++) generic_val_free(&slots[i]);
+    free(slots);
+    return start_off;
+}
+
 /* Builds the final entry name: known name+ext from the file table when
    has_hash and a match is found, otherwise signature-detected extension with
    a running fallback index (mirrors unpack_ovl.py's _name_for_hash). */
@@ -794,14 +1101,19 @@ static void name_for_hash(const ovl_header_t *header, int has_hash, uint32_t fil
    Fragment offsets. When num_datas>0, buffers are named via DataEntry/
    BufferGroup instead of being anonymous "<arc>_bufNNN.bin".
 
-   REMAINING LIMITATION: some resource types (confirmed for
-   Casino:XMLConfig:xmlconfig) are not simple contiguous byte blobs -- their
-   RootEntry points only to a small internal reference/relocation stub, not
-   the final content, which requires the engine's separate "structured data"
-   deserialization to reconstruct. Such files are still correctly separated
-   and named, but their extracted bytes are that stub, not the full decoded
-   content. Confirmed rare (1 of 4,750 files in a full JWE2 asset-tree scan);
-   regular assets (textures, models, audio, Lua modules) are unaffected. */
+   STRUCTURED DATA: many resource types are not simple contiguous byte blobs
+   -- their RootEntry points only to a small MemStruct header whose pointer
+   fields are all zero placeholders on disk; the real data is elsewhere and
+   only reachable by resolving each pointer via the Fragment table. Known
+   types (Casino:AssetPackageRes:assetpkg, Casino:WorldDesc:world,
+   Casino:XMLConfig:xmlconfig) get exact, byte-verified resolvers (see
+   resolve_assetpkg/resolve_worlddesc/resolve_xmlconfig above). Any other
+   type whose struct contains at least one resolvable pointer field falls
+   back to resolve_generic_structured: a self-invented, best-effort pseudo-
+   XML dump of the resolved pointer graph (no claim of matching a real
+   engine schema) -- still far more useful than the meaningless raw stub.
+   Regular buffer-backed assets (textures, models, audio, Lua modules) are
+   unaffected either way. */
 static void build_entries_for_archive(ovl_wcx_handle_t *ctx, int arc_idx,
                                        const unsigned char *decomp, size_t decomp_size) {
     const ovl_archive_t *arc = &ctx->header.archives[arc_idx];
@@ -840,6 +1152,9 @@ static void build_entries_for_archive(ovl_wcx_handle_t *ctx, int arc_idx,
             }
         }
         growbuf_t synth = {0};
+
+        int bounds_count = 0;
+        pool_boundary_t *bounds = build_pool_boundaries(root_entries, root_count, fragments, frag_count, &bounds_count);
 
         ovl_sub_file_t *subs = NULL; int sub_count = 0;
         if (ovl_resolve_pool_sub_files(pools, pool_count, root_entries, root_count,
@@ -907,6 +1222,49 @@ static void build_entries_for_archive(ovl_wcx_handle_t *ctx, int arc_idx,
                 }
                 if (sub_finfo && is_structured_data_ext(sub_finfo->ext)) continue;
 
+                /* Unknown type (no dedicated resolver above) -- check whether
+                   any 8-byte slot in this range has a Fragment link. If so,
+                   it's another MemStruct-style object with pointer fields
+                   (like assetpkg/world/xmlconfig), just without a known
+                   schema -- generic best-effort dump instead of the
+                   meaningless raw stub (see resolve_generic_structured). */
+                int has_pointer = 0;
+                if (frags_sorted) {
+                    for (uint64_t o = 0; o + 8 <= subs[i].size; o += 8) {
+                        if (find_link(frags_sorted, frag_count, subs[i].pool_index, (uint32_t)(subs[i].offset + o))) {
+                            has_pointer = 1;
+                            break;
+                        }
+                    }
+                }
+                if (has_pointer) {
+                    const char *type_name = "Unknown";
+                    if (sub_finfo) {
+                        const char *c1 = strchr(sub_finfo->ext, ':');
+                        if (c1) type_name = c1 + 1; /* still "Class:ext" here, trimmed below */
+                    }
+                    char type_buf[100];
+                    if (type_name != NULL) {
+                        strncpy(type_buf, type_name, sizeof(type_buf) - 1); type_buf[sizeof(type_buf) - 1] = '\0';
+                        char *c2 = strchr(type_buf, ':');
+                        if (c2) *c2 = '\0';
+                    } else {
+                        strcpy(type_buf, "Unknown");
+                    }
+                    const char *file_name = sub_finfo ? sub_finfo->name : "unknown";
+                    size_t out_size = 0;
+                    uint64_t off = resolve_generic_structured(&synth, decomp, decomp_size, pools, pool_count,
+                                                               pool_region_start, frags_sorted, frag_count,
+                                                               bounds, bounds_count, subs[i].pool_index,
+                                                               (uint32_t)subs[i].offset, (uint32_t)subs[i].size,
+                                                               type_buf, file_name, &out_size);
+                    char full[400];
+                    name_for_hash(&ctx->header, 1, subs[i].file_hash, synth.data + off, out_size,
+                                  "unknown", &unknown_idx, full, sizeof(full));
+                    push_synth_entry(ctx, full, out_size, arc_idx, off);
+                    continue;
+                }
+
                 int pidx = subs[i].pool_index;
                 uint64_t raw_start = (uint64_t)pool_region_start + pools[pidx].offset + subs[i].offset;
                 uint64_t start, sz;
@@ -921,6 +1279,7 @@ static void build_entries_for_archive(ovl_wcx_handle_t *ctx, int arc_idx,
         }
         ctx->synth_bufs[arc_idx] = synth.data;
         ctx->synth_sizes[arc_idx] = synth.size;
+        free(bounds);
         free(frags_sorted);
         free(subs);
         free(root_entries);
