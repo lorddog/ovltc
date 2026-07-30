@@ -37,6 +37,10 @@ static int ovl_debug_enabled(void) {
 }
 #define DBG(...) do { if (ovl_debug_enabled()) fprintf(stderr, __VA_ARGS__); } while (0)
 
+/* This DLL's own module handle, set in DllMain. Used to locate the plugin's
+   own directory as a fallback place to look for the Oodle DLL. */
+static HMODULE g_hinst = NULL;
+
 /* ---------------------------------------------------------------------------
  * Data structures
  * ------------------------------------------------------------------------- */
@@ -44,8 +48,11 @@ static int ovl_debug_enabled(void) {
 typedef struct {
     wchar_t name[600];   /* display name including subfolders (with '\\') */
     uint64_t size;
-    int archive_index;   /* index into ctx->decomp_bufs */
+    int archive_index;   /* index into ctx->decomp_bufs / ctx->synth_bufs */
     uint64_t data_offset;
+    int is_synth;        /* 1 if data_offset/size refer to ctx->synth_bufs[archive_index]
+                             instead of ctx->decomp_bufs[archive_index] (reconstructed
+                             "structured data" content, e.g. resolved .assetpkg XML) */
 } ovl_entry_t;
 
 typedef struct {
@@ -57,6 +64,10 @@ typedef struct {
     unsigned char **decomp_bufs;  /* parallel to header.archives */
     size_t *decomp_sizes;
     int *owns_buf;                /* 1 if decomp_bufs[i] was allocated separately */
+
+    unsigned char **synth_bufs;   /* parallel to header.archives; reconstructed
+                                     "structured data" content (always owned) */
+    size_t *synth_sizes;
 
     ovl_entry_t *entries;
     int entry_count;
@@ -150,6 +161,25 @@ static int file_exists_w(const wchar_t *path) {
     return attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY);
 }
 
+/* Returns the directory this DLL itself lives in (no trailing backslash).
+   Used as a fallback location for the Oodle DLL: dropping oo2core_*.dll
+   next to the plugin lets it decompress Oodle archives even when the .ovl
+   being opened isn't inside a full game installation (e.g. a standalone
+   test file). Returns 0 on failure. */
+static int get_plugin_dir(wchar_t *out, size_t out_count) {
+    wchar_t path[MAX_PATH];
+    DWORD len = GetModuleFileNameW(g_hinst, path, MAX_PATH);
+    if (len == 0 || len >= MAX_PATH) return 0;
+
+    wchar_t *slash = wcsrchr(path, L'\\');
+    if (!slash) return 0;
+    *slash = L'\0';
+
+    wcsncpy(out, path, out_count - 1);
+    out[out_count - 1] = L'\0';
+    return 1;
+}
+
 static int push_entry(ovl_wcx_handle_t *ctx, const char *ascii_name,
                        uint64_t size, int archive_index, uint64_t data_offset) {
     if (ctx->entry_count >= ctx->entry_capacity) {
@@ -173,6 +203,16 @@ static int push_entry(ovl_wcx_handle_t *ctx, const char *ascii_name,
     e->size = size;
     e->archive_index = archive_index;
     e->data_offset = data_offset;
+    e->is_synth = 0;
+    return 1;
+}
+
+/* Same as push_entry, but the data lives in ctx->synth_bufs[archive_index]
+   (reconstructed content) instead of ctx->decomp_bufs[archive_index]. */
+static int push_synth_entry(ovl_wcx_handle_t *ctx, const char *ascii_name,
+                             uint64_t size, int archive_index, uint64_t data_offset) {
+    if (!push_entry(ctx, ascii_name, size, archive_index, data_offset)) return 0;
+    ctx->entries[ctx->entry_count - 1].is_synth = 1;
     return 1;
 }
 
@@ -192,86 +232,831 @@ static void py_slice_bounds(uint64_t total_size, uint64_t start, uint64_t reques
     *out_len = e - s;
 }
 
+/* Resource types whose real content is not a plain contiguous byte range at
+   the RootEntry's data_offset, but requires the engine's separate "structured
+   data"/symbol-relocation deserialization system (fResOverlayData::
+   RequestStructuredData). Without a dedicated resolver the naive offset only
+   resolves to a meaningless index stub (often just a few zero bytes), not the
+   real content, so such entries are skipped entirely rather than written out
+   as garbage. assetpkg/world/xmlconfig now have dedicated resolvers (see
+   resolve_assetpkg/resolve_worlddesc/resolve_xmlconfig above) and are handled
+   before this fallback is ever reached; kept as a safety net for any other
+   structured type encountered in the future -- currently none are known, so
+   this always returns 0. */
+static int is_structured_data_ext(const char *ext) {
+    if (!ext) return 0;
+    char lower[100];
+    strncpy(lower, ext, sizeof(lower) - 1);
+    lower[sizeof(lower) - 1] = '\0';
+    for (char *p = lower; *p; p++) *p = (char)tolower((unsigned char)*p);
+    (void)lower;
+    return 0;
+}
+
+/* Name of the game these files come from, used verbatim in the "game" XML
+   attribute of resolved structured-data types (matches the reference
+   exporter's output for this preset). */
+#define GAME_NAME "Jurassic World Evolution 2"
+
+/* Fragments sorted by (link_pool, link_offset) for binary search: each
+   Fragment says "the pointer field at (link_pool, link_offset) resolves to
+   the data at (struct_pool, struct_offset)". */
+static int cmp_fragment_by_link(const void *a, const void *b) {
+    const ovl_fragment_t *fa = (const ovl_fragment_t *)a;
+    const ovl_fragment_t *fb = (const ovl_fragment_t *)b;
+    if (fa->link_pool != fb->link_pool) return (fa->link_pool > fb->link_pool) - (fa->link_pool < fb->link_pool);
+    return (fa->link_offset > fb->link_offset) - (fa->link_offset < fb->link_offset);
+}
+
+static const ovl_fragment_t *find_link(const ovl_fragment_t *sorted, int count,
+                                        int32_t pool_index, uint32_t offset) {
+    int lo = 0, hi = count - 1;
+    while (lo <= hi) {
+        int mid = lo + (hi - lo) / 2;
+        const ovl_fragment_t *f = &sorted[mid];
+        int cmp = (f->link_pool != pool_index) ? (f->link_pool > pool_index ? 1 : -1)
+                                                : (f->link_offset > offset) - (f->link_offset < offset);
+        if (cmp == 0) return f;
+        if (cmp < 0) lo = mid + 1; else hi = mid - 1;
+    }
+    return NULL;
+}
+
+/* Reconstructs a Casino:AssetPackageRes:assetpkg file's real XML content.
+   See unpack_ovl.py's _resolve_assetpkg for the full explanation: on disk,
+   an AssetpkgRoot MemStruct is just an 8-byte Pointer (to a NUL-terminated
+   asset path string) followed by an 8-byte 'shared' Uint64 (usually 0).
+   Verified byte-for-byte against a known-good reference extraction of
+   test/Init.ovl's 'acu' entry. Returns a malloc'd buffer (caller frees) or
+   NULL if the pointer couldn't be resolved. */
+static unsigned char *resolve_assetpkg(const unsigned char *decomp, size_t decomp_size,
+                                        const ovl_pool_t *pools, int pool_count,
+                                        uint32_t pool_region_start,
+                                        const ovl_fragment_t *frags_sorted, int frag_count,
+                                        int32_t pool_index, uint32_t data_offset,
+                                        size_t *out_size) {
+    const ovl_fragment_t *link = find_link(frags_sorted, frag_count, pool_index, data_offset);
+    if (!link) return NULL;
+    int32_t spool = link->struct_pool;
+    if (spool < 0 || spool >= pool_count) return NULL;
+    uint64_t str_start = (uint64_t)pool_region_start + pools[spool].offset + link->struct_offset;
+    if (str_start >= decomp_size) return NULL;
+    size_t max_len = decomp_size - (size_t)str_start;
+    if (max_len > 4096) max_len = 4096;
+    const unsigned char *str_begin = decomp + str_start;
+    size_t str_len = 0;
+    while (str_len < max_len && str_begin[str_len] != 0) str_len++;
+    if (str_len == max_len) return NULL; /* no NUL terminator found within bound */
+
+    /* 'shared' Uint64 follows the asset_path pointer (offset +8); only
+       rendered as an XML attribute when non-zero. */
+    uint64_t shared_val = 0;
+    if (pool_index >= 0 && pool_index < pool_count) {
+        uint64_t shared_off = (uint64_t)pool_region_start + pools[pool_index].offset + data_offset + 8;
+        if (shared_off + 8 <= decomp_size) memcpy(&shared_val, decomp + shared_off, 8);
+    }
+
+    char shared_attr[48];
+    shared_attr[0] = '\0';
+    if (shared_val != 0) _snprintf(shared_attr, sizeof(shared_attr) - 1, " shared=\"%llu\"", (unsigned long long)shared_val);
+
+    size_t cap = str_len + sizeof(shared_attr) + 128;
+    unsigned char *out = (unsigned char *)malloc(cap);
+    if (!out) return NULL;
+    int n = _snprintf((char *)out, cap - 1, "<AssetpkgRoot%s game=\"%s\">\n\t<asset_path>%.*s</asset_path>\n</AssetpkgRoot>\n",
+                       shared_attr, GAME_NAME, (int)str_len, (const char *)str_begin);
+    if (n < 0) { free(out); return NULL; }
+    *out_size = (size_t)n;
+    return out;
+}
+
+/* Reads a NUL-terminated string at (pool_index, offset), resolved via the
+   Fragment link table (like resolve_assetpkg's target lookup, but taking an
+   already-known target location directly instead of looking up a pointer
+   field). Returns a pointer into decomp and sets *out_len; NULL if no NUL
+   terminator is found within a sane bound. */
+static const char *read_zstring_at(const unsigned char *decomp, size_t decomp_size,
+                                    const ovl_pool_t *pools, int pool_count,
+                                    uint32_t pool_region_start, int32_t pool_index, uint32_t offset,
+                                    size_t *out_len) {
+    if (pool_index < 0 || pool_index >= pool_count) return NULL;
+    uint64_t start = (uint64_t)pool_region_start + pools[pool_index].offset + offset;
+    if (start >= decomp_size) return NULL;
+    size_t max_len = decomp_size - (size_t)start;
+    if (max_len > 4096) max_len = 4096;
+    const char *begin = (const char *)(decomp + start);
+    size_t len = 0;
+    while (len < max_len && begin[len] != 0) len++;
+    if (len == max_len) return NULL;
+    *out_len = len;
+    return begin;
+}
+
+/* WorldHeader ZStringList sub-elements (asset_pkgs/prefabs) always carry this
+   pool_type attribute for this game preset (derived from a MIME constant tied
+   to the resource type, not stored per-pool on disk; verified against
+   test/Init.ovl -- hardcoding avoids implementing the whole MIME/pool-type
+   lookup system for a single constant). */
+#define WORLD_ZSTRINGLIST_POOL_TYPE "4"
+
+/* Small growable append-only buffer, used to collect reconstructed
+   "structured data" content (e.g. resolved .assetpkg/.world XML) for one
+   archive. Its final buffer is handed to
+   ctx->synth_bufs[arc_idx]/synth_sizes[arc_idx] once build_entries_for_archive
+   is done, since decomp itself may not be a private, reallocatable buffer
+   (e.g. uncompressed STATIC data points directly into the read-only mmapped
+   .ovl file). */
+typedef struct { unsigned char *data; size_t size; size_t cap; } growbuf_t;
+
+static uint64_t growbuf_append(growbuf_t *gb, const unsigned char *bytes, size_t n) {
+    if (gb->size + n > gb->cap) {
+        size_t new_cap = gb->cap ? gb->cap * 2 : 4096;
+        while (new_cap < gb->size + n) new_cap *= 2;
+        unsigned char *p = (unsigned char *)realloc(gb->data, new_cap);
+        if (!p) return (uint64_t)-1;
+        gb->data = p;
+        gb->cap = new_cap;
+    }
+    memcpy(gb->data + gb->size, bytes, n);
+    uint64_t off = gb->size;
+    gb->size += n;
+    return off;
+}
+
+/* Appends "\t\t<pointer>{name}</pointer>\n" for each resolved ZStringList
+   element to gb. Returns 0 on failure (unresolvable pointer). */
+static int append_zstringlist_items(growbuf_t *gb, const unsigned char *decomp, size_t decomp_size,
+                                     const ovl_pool_t *pools, int pool_count, uint32_t pool_region_start,
+                                     const ovl_fragment_t *frags_sorted, int frag_count,
+                                     int32_t array_pool, uint32_t array_offset, uint64_t count) {
+    for (uint64_t i = 0; i < count; i++) {
+        const ovl_fragment_t *elem = find_link(frags_sorted, frag_count, array_pool, (uint32_t)(array_offset + i * 8));
+        if (!elem) return 0;
+        size_t slen;
+        const char *s = read_zstring_at(decomp, decomp_size, pools, pool_count, pool_region_start,
+                                         elem->struct_pool, elem->struct_offset, &slen);
+        if (!s) return 0;
+        char line[4200];
+        int n = _snprintf(line, sizeof(line) - 1, "\t\t<pointer>%.*s</pointer>\n", (int)slen, s);
+        if (n < 0) return 0;
+        if (growbuf_append(gb, (const unsigned char *)line, (size_t)n) == (uint64_t)-1) return 0;
+    }
+    return 1;
+}
+
+/* Reconstructs a Casino:WorldDesc:world file's real XML content. See
+   unpack_ovl.py's _resolve_worlddesc for the full field-layout explanation
+   (80-byte fixed WorldHeader MemStruct, verified against test/Init.ovl's
+   'classic_03_tropical' entry). Appends the result directly to `out` (a
+   per-archive growbuf) since its size isn't known upfront (variable number of
+   asset_pkgs/prefabs pointers); returns the byte offset of the start of the
+   written content within `out`, or (uint64_t)-1 on failure. */
+static uint64_t resolve_worlddesc(growbuf_t *out, const unsigned char *decomp, size_t decomp_size,
+                                   const ovl_pool_t *pools, int pool_count, uint32_t pool_region_start,
+                                   const ovl_fragment_t *frags_sorted, int frag_count,
+                                   int32_t pool_index, uint32_t data_offset, size_t *out_size) {
+    if (pool_index < 0 || pool_index >= pool_count) return (uint64_t)-1;
+    uint64_t struct_start = (uint64_t)pool_region_start + pools[pool_index].offset + data_offset;
+    if (struct_start + 80 > decomp_size) return (uint64_t)-1;
+    const unsigned char *raw = decomp + struct_start;
+
+    uint64_t world_type, asset_pkgs_count, prefabs_count;
+    memcpy(&world_type, raw + 0, 8);
+    memcpy(&asset_pkgs_count, raw + 16, 8);
+    memcpy(&prefabs_count, raw + 64, 8);
+
+    const ovl_fragment_t *lua_link = find_link(frags_sorted, frag_count, pool_index, data_offset + 24);
+    if (!lua_link) return (uint64_t)-1;
+    size_t lua_len;
+    const char *lua_name = read_zstring_at(decomp, decomp_size, pools, pool_count, pool_region_start,
+                                            lua_link->struct_pool, lua_link->struct_offset, &lua_len);
+    if (!lua_name) return (uint64_t)-1;
+
+    uint64_t start_off = out->size;
+    char head[128];
+    int n = _snprintf(head, sizeof(head) - 1, "<WorldHeader world_type=\"%llu\" game=\"%s\">\n",
+                       (unsigned long long)world_type, GAME_NAME);
+    if (n < 0 || growbuf_append(out, (const unsigned char *)head, (size_t)n) == (uint64_t)-1) return (uint64_t)-1;
+
+    if (asset_pkgs_count > 0) {
+        const ovl_fragment_t *arr = find_link(frags_sorted, frag_count, pool_index, data_offset + 8);
+        if (!arr) return (uint64_t)-1;
+        const char *tag_open = "\t<asset_pkgs pool_type=\"" WORLD_ZSTRINGLIST_POOL_TYPE "\">\n";
+        growbuf_append(out, (const unsigned char *)tag_open, strlen(tag_open));
+        if (!append_zstringlist_items(out, decomp, decomp_size, pools, pool_count, pool_region_start,
+                                       frags_sorted, frag_count, arr->struct_pool, arr->struct_offset, asset_pkgs_count))
+            return (uint64_t)-1;
+        const char *tag_close = "\t</asset_pkgs>\n";
+        growbuf_append(out, (const unsigned char *)tag_close, strlen(tag_close));
+    }
+
+    char lua_elem[4200];
+    n = _snprintf(lua_elem, sizeof(lua_elem) - 1, "\t<lua_name>%.*s</lua_name>\n", (int)lua_len, lua_name);
+    if (n < 0 || growbuf_append(out, (const unsigned char *)lua_elem, (size_t)n) == (uint64_t)-1) return (uint64_t)-1;
+
+    if (prefabs_count > 0) {
+        const ovl_fragment_t *arr = find_link(frags_sorted, frag_count, pool_index, data_offset + 48);
+        if (!arr) return (uint64_t)-1;
+        const char *tag_open = "\t<prefabs pool_type=\"" WORLD_ZSTRINGLIST_POOL_TYPE "\">\n";
+        growbuf_append(out, (const unsigned char *)tag_open, strlen(tag_open));
+        if (!append_zstringlist_items(out, decomp, decomp_size, pools, pool_count, pool_region_start,
+                                       frags_sorted, frag_count, arr->struct_pool, arr->struct_offset, prefabs_count))
+            return (uint64_t)-1;
+        const char *tag_close = "\t</prefabs>\n";
+        growbuf_append(out, (const unsigned char *)tag_close, strlen(tag_close));
+    }
+
+    const char *tail = "</WorldHeader>\n";
+    growbuf_append(out, (const unsigned char *)tail, strlen(tail));
+    *out_size = (size_t)(out->size - start_off);
+    return start_off;
+}
+
+/* ---------------------------------------------------------------------------
+ * Minimal XML parser + tab-indenting serializer (for Casino:XMLConfig:xmlconfig)
+ *
+ * XmlconfigRoot's on-disk content is a single raw XML string (see
+ * resolve_xmlconfig below), which the reference exporter nests under a
+ * synthetic <xml_string> element inside <XmlconfigRoot game="...">, then
+ * re-serializes the WHOLE tree with a tab-based pretty-printer (see
+ * unpack_ovl.py's _xml_indent for the exact recipe this mirrors). This is a
+ * small hand-rolled parser/printer covering exactly what real game config
+ * files use (nested elements, attributes, leaf text) -- no comments/CDATA/
+ * namespaces/processing instructions beyond the leading '<?xml ?>' prolog.
+ * ------------------------------------------------------------------------- */
+
+typedef struct { char *name; char *value; } xml_attr_t;
+typedef struct xml_node {
+    char *tag;
+    xml_attr_t *attrs; int attr_count;
+    char *text;                          /* NULL if this node has children instead */
+    struct xml_node **children; int child_count;
+} xml_node_t;
+
+static xml_node_t *xml_node_new(void) { return (xml_node_t *)calloc(1, sizeof(xml_node_t)); }
+
+static void xml_node_free(xml_node_t *n) {
+    if (!n) return;
+    free(n->tag);
+    for (int i = 0; i < n->attr_count; i++) { free(n->attrs[i].name); free(n->attrs[i].value); }
+    free(n->attrs);
+    free(n->text);
+    for (int i = 0; i < n->child_count; i++) xml_node_free(n->children[i]);
+    free(n->children);
+    free(n);
+}
+
+static char *xml_unescape(const char *s, size_t len) {
+    char *out = (char *)malloc(len + 1);
+    if (!out) return NULL;
+    size_t oi = 0;
+    for (size_t i = 0; i < len;) {
+        if (s[i] == '&') {
+            if (i + 4 <= len && strncmp(s + i, "&lt;", 4) == 0) { out[oi++] = '<'; i += 4; continue; }
+            if (i + 4 <= len && strncmp(s + i, "&gt;", 4) == 0) { out[oi++] = '>'; i += 4; continue; }
+            if (i + 5 <= len && strncmp(s + i, "&amp;", 5) == 0) { out[oi++] = '&'; i += 5; continue; }
+            if (i + 6 <= len && strncmp(s + i, "&quot;", 6) == 0) { out[oi++] = '"'; i += 6; continue; }
+            if (i + 6 <= len && strncmp(s + i, "&apos;", 6) == 0) { out[oi++] = '\''; i += 6; continue; }
+            if (i + 1 < len && s[i + 1] == '#') {
+                size_t j = i + 2; int hex = 0;
+                if (j < len && (s[j] == 'x' || s[j] == 'X')) { hex = 1; j++; }
+                long val = 0; size_t k = j;
+                while (k < len && s[k] != ';') {
+                    char c = s[k];
+                    int d = hex ? (isdigit((unsigned char)c) ? c - '0' : (isxdigit((unsigned char)c) ? tolower((unsigned char)c) - 'a' + 10 : -1))
+                                : (isdigit((unsigned char)c) ? c - '0' : -1);
+                    if (d < 0) break;
+                    val = val * (hex ? 16 : 10) + d;
+                    k++;
+                }
+                if (k < len && s[k] == ';') { out[oi++] = (char)val; i = k + 1; continue; }
+            }
+        }
+        out[oi++] = s[i++];
+    }
+    out[oi] = '\0';
+    return out;
+}
+
+static void xml_skip_ws(const char **p) { while (isspace((unsigned char)**p)) (*p)++; }
+
+static char *xml_read_name(const char **p) {
+    const char *start = *p;
+    while (isalnum((unsigned char)**p) || **p == '_' || **p == ':' || **p == '-' || **p == '.') (*p)++;
+    size_t n = (size_t)(*p - start);
+    char *out = (char *)malloc(n + 1);
+    if (out) { memcpy(out, start, n); out[n] = '\0'; }
+    return out;
+}
+
+static void xml_add_child(xml_node_t *parent, xml_node_t *child) {
+    xml_node_t **n = (xml_node_t **)realloc(parent->children, sizeof(xml_node_t *) * (size_t)(parent->child_count + 1));
+    if (!n) { xml_node_free(child); return; }
+    parent->children = n;
+    parent->children[parent->child_count++] = child;
+}
+
+static void xml_add_attr(xml_node_t *node, char *name, char *value) {
+    xml_attr_t *n = (xml_attr_t *)realloc(node->attrs, sizeof(xml_attr_t) * (size_t)(node->attr_count + 1));
+    if (!n) { free(name); free(value); return; }
+    node->attrs = n;
+    node->attrs[node->attr_count].name = name;
+    node->attrs[node->attr_count].value = value;
+    node->attr_count++;
+}
+
+static xml_node_t *xml_parse_element(const char **p) {
+    xml_skip_ws(p);
+    if (**p != '<') return NULL;
+    (*p)++;
+    xml_node_t *node = xml_node_new();
+    if (!node) return NULL;
+    node->tag = xml_read_name(p);
+
+    for (;;) {
+        xml_skip_ws(p);
+        if ((*p)[0] == '/' && (*p)[1] == '>') { *p += 2; return node; } /* self-closing, no text/children */
+        if (**p == '>') { (*p)++; break; }
+        if (**p == '\0') return node; /* malformed input, bail out gracefully */
+        char *aname = xml_read_name(p);
+        xml_skip_ws(p);
+        if (**p == '=') {
+            (*p)++;
+            xml_skip_ws(p);
+            char quote = **p;
+            if (quote == '"' || quote == '\'') {
+                (*p)++;
+                const char *vstart = *p;
+                while (**p && **p != quote) (*p)++;
+                char *aval = xml_unescape(vstart, (size_t)(*p - vstart));
+                if (**p == quote) (*p)++;
+                xml_add_attr(node, aname, aval);
+            } else {
+                free(aname); /* malformed attribute, skip */
+            }
+        } else {
+            free(aname);
+        }
+    }
+
+    for (;;) {
+        if ((*p)[0] == '<' && (*p)[1] == '/') {
+            *p += 2;
+            char *closename = xml_read_name(p);
+            free(closename);
+            xml_skip_ws(p);
+            if (**p == '>') (*p)++;
+            break;
+        }
+        if (**p == '<') {
+            xml_node_t *child = xml_parse_element(p);
+            if (child) xml_add_child(node, child);
+            else break;
+            continue;
+        }
+        if (**p == '\0') break;
+        const char *tstart = *p;
+        while (**p && **p != '<') (*p)++;
+        if (node->child_count == 0) {
+            free(node->text);
+            node->text = xml_unescape(tstart, (size_t)(*p - tstart));
+        }
+    }
+    return node;
+}
+
+static void xml_append_str(growbuf_t *out, const char *s) { growbuf_append(out, (const unsigned char *)s, strlen(s)); }
+
+static void xml_append_escaped(growbuf_t *out, const char *s, int is_attr) {
+    for (; *s; s++) {
+        switch (*s) {
+            case '&': xml_append_str(out, "&amp;"); break;
+            case '<': xml_append_str(out, "&lt;"); break;
+            case '>': xml_append_str(out, "&gt;"); break;
+            case '"': if (is_attr) xml_append_str(out, "&quot;"); else growbuf_append(out, (const unsigned char *)s, 1); break;
+            default: growbuf_append(out, (const unsigned char *)s, 1);
+        }
+    }
+}
+
+static void xml_append_tabs(growbuf_t *out, int level) {
+    growbuf_append(out, (const unsigned char *)"\n", 1);
+    for (int i = 0; i < level; i++) growbuf_append(out, (const unsigned char *)"\t", 1);
+}
+
+/* Tab-indented serialization matching the reference exporter byte-for-byte
+   (see unpack_ovl.py's _xml_indent for the equivalent recipe, and the
+   comment there for why printing "\n+(level+1)tabs" before each child and
+   "\n+level tabs" once after the loop is mathematically equivalent to that
+   tail-mutation recipe). */
+static void xml_print_node(growbuf_t *out, const xml_node_t *n, int level) {
+    xml_append_str(out, "<");
+    xml_append_str(out, n->tag);
+    for (int i = 0; i < n->attr_count; i++) {
+        xml_append_str(out, " ");
+        xml_append_str(out, n->attrs[i].name);
+        xml_append_str(out, "=\"");
+        xml_append_escaped(out, n->attrs[i].value, 1);
+        xml_append_str(out, "\"");
+    }
+    /* No children AND no text (i.e. was self-closing "<tag/>" in the source,
+       distinct from an explicit empty "<tag></tag>") -> ElementTree renders
+       this as a self-closing "<tag ... />" (with a space before "/>"). */
+    if (n->child_count == 0 && !n->text) {
+        xml_append_str(out, " />");
+        return;
+    }
+    xml_append_str(out, ">");
+    if (n->child_count > 0) {
+        for (int i = 0; i < n->child_count; i++) {
+            xml_append_tabs(out, level + 1);
+            xml_print_node(out, n->children[i], level + 1);
+        }
+        xml_append_tabs(out, level);
+    } else {
+        xml_append_escaped(out, n->text, 0);
+    }
+    xml_append_str(out, "</");
+    xml_append_str(out, n->tag);
+    xml_append_str(out, ">");
+}
+
+/* Reconstructs a Casino:XMLConfig:xmlconfig file's real XML content. See
+   unpack_ovl.py's _resolve_xmlconfig for the full explanation: XmlconfigRoot
+   is a single 8-byte Pointer field (xml_string) at offset 0, pointing to a
+   NUL-terminated raw XML string with a leading '<?xml ...?>' declaration that
+   gets stripped before parsing. The parsed tree is nested under a synthetic
+   <xml_string> element inside <XmlconfigRoot game="...">, and the whole tree
+   is re-indented -- so the original formatting of the embedded config is
+   discarded. Output verified byte-for-byte against a known-good reference
+   extraction for all 32 entries in test/Config.ovl. Appends to `out` like
+   resolve_worlddesc;
+   returns the start offset within `out`, or (uint64_t)-1 on failure. */
+static uint64_t resolve_xmlconfig(growbuf_t *out, const unsigned char *decomp, size_t decomp_size,
+                                   const ovl_pool_t *pools, int pool_count, uint32_t pool_region_start,
+                                   const ovl_fragment_t *frags_sorted, int frag_count,
+                                   int32_t pool_index, uint32_t data_offset, size_t *out_size) {
+    const ovl_fragment_t *link = find_link(frags_sorted, frag_count, pool_index, data_offset);
+    if (!link) return (uint64_t)-1;
+    size_t raw_len;
+    const char *raw = read_zstring_at(decomp, decomp_size, pools, pool_count, pool_region_start,
+                                       link->struct_pool, link->struct_offset, &raw_len);
+    if (!raw) return (uint64_t)-1;
+
+    const char *text = raw;
+    size_t text_len = raw_len;
+    if (text_len >= 5 && strncmp(text, "<?xml", 5) == 0) {
+        const char *end = NULL;
+        for (size_t i = 0; i + 1 < text_len; i++) {
+            if (text[i] == '?' && text[i + 1] == '>') { end = text + i + 2; break; }
+        }
+        if (end) {
+            while (end < text + text_len && (*end == '\r' || *end == '\n')) end++;
+            text_len -= (size_t)(end - text);
+            text = end;
+        }
+    }
+    /* xml_parse_element needs a NUL-terminated, mutable-scan buffer */
+    char *buf = (char *)malloc(text_len + 1);
+    if (!buf) return (uint64_t)-1;
+    memcpy(buf, text, text_len);
+    buf[text_len] = '\0';
+    const char *cursor = buf;
+    xml_node_t *inner = xml_parse_element(&cursor);
+    if (!inner) { free(buf); return (uint64_t)-1; }
+
+    xml_node_t *root = xml_node_new();
+    xml_node_t *xml_string_elem = xml_node_new();
+    if (!root || !xml_string_elem) { xml_node_free(root); xml_node_free(xml_string_elem); xml_node_free(inner); free(buf); return (uint64_t)-1; }
+    root->tag = _strdup("XmlconfigRoot");
+    xml_add_attr(root, _strdup("game"), _strdup(GAME_NAME));
+    xml_string_elem->tag = _strdup("xml_string");
+    xml_add_child(xml_string_elem, inner);
+    xml_add_child(root, xml_string_elem);
+
+    uint64_t start_off = out->size;
+    xml_print_node(out, root, 0);
+    xml_append_str(out, "\n"); /* root's own trailing tail, per the tab-indent recipe */
+    *out_size = (size_t)(out->size - start_off);
+
+    xml_node_free(root);
+    free(buf);
+    return start_off;
+}
+
+/* Builds the final entry name: known name+ext from the file table when
+   has_hash and a match is found, otherwise signature-detected extension with
+   a running fallback index (mirrors unpack_ovl.py's _name_for_hash). */
+static void name_for_hash(const ovl_header_t *header, int has_hash, uint32_t file_hash,
+                           const unsigned char *data, size_t data_size,
+                           const char *fallback_prefix, int *fallback_idx,
+                           char *out, size_t out_size) {
+    const ovl_file_t *finfo = has_hash ? ovl_find_file_by_hash(header, file_hash) : NULL;
+    if (finfo) {
+        char name_buf[280];
+        char ext_buf[100];
+        strncpy(name_buf, finfo->name, sizeof(name_buf) - 1); name_buf[sizeof(name_buf) - 1] = '\0';
+        ovl_sanitize(name_buf);
+        /* finfo->ext is a full type string "Namespace:Class:extension" (e.g.
+           "Casino:WorldDesc:world") -- only the part after the last ':' is
+           the actual file extension (e.g. just ".world"). */
+        const char *ext_src = finfo->ext;
+        const char *last_colon = strrchr(ext_src, ':');
+        if (last_colon) ext_src = last_colon + 1;
+        strncpy(ext_buf, ext_src, sizeof(ext_buf) - 1); ext_buf[sizeof(ext_buf) - 1] = '\0';
+        if (ext_buf[0] != '\0' && ext_buf[0] != '.') {
+            char tmp[100];
+            ovl_sanitize(ext_buf);
+            _snprintf(tmp, sizeof(tmp) - 1, ".%s", ext_buf);
+            tmp[sizeof(tmp) - 1] = '\0';
+            strncpy(ext_buf, tmp, sizeof(ext_buf) - 1); ext_buf[sizeof(ext_buf) - 1] = '\0';
+        } else {
+            ovl_sanitize(ext_buf);
+        }
+        _snprintf(out, out_size - 1, "%s%s", name_buf, ext_buf);
+        out[out_size - 1] = '\0';
+        return;
+    }
+    const char *detected = ovl_detect_ext(data, data_size);
+    const char *ext = detected ? detected : ".bin";
+    _snprintf(out, out_size - 1, "%s-%04d%s", fallback_prefix, (*fallback_idx)++, ext);
+    out[out_size - 1] = '\0';
+}
+
 /* Processes the pool and buffer data of a decompressed archive and appends
-   the corresponding entries. decomp/decomp_size belong to arc. */
+   the corresponding entries. decomp/decomp_size belong to arc.
+
+   Layout:
+   [pool_groups][pools][data_entries][buffer_entries][buffer_groups]
+   [root_entries][fragments][set_header] -> then the pools' raw data, then
+   the buffers' raw data. When num_root_entries>0 a pool may bundle several
+   named resources; their boundaries are resolved via sorted RootEntry/
+   Fragment offsets. When num_datas>0, buffers are named via DataEntry/
+   BufferGroup instead of being anonymous "<arc>_bufNNN.bin".
+
+   REMAINING LIMITATION: some resource types (confirmed for
+   Casino:XMLConfig:xmlconfig) are not simple contiguous byte blobs -- their
+   RootEntry points only to a small internal reference/relocation stub, not
+   the final content, which requires the engine's separate "structured data"
+   deserialization to reconstruct. Such files are still correctly separated
+   and named, but their extracted bytes are that stub, not the full decoded
+   content. Confirmed rare (1 of 4,750 files in a full JWE2 asset-tree scan);
+   regular assets (textures, models, audio, Lua modules) are unaffected. */
 static void build_entries_for_archive(ovl_wcx_handle_t *ctx, int arc_idx,
                                        const unsigned char *decomp, size_t decomp_size) {
     const ovl_archive_t *arc = &ctx->header.archives[arc_idx];
     int version = ctx->header.version;
 
-    uint32_t set_data_size = arc->set_data_size;
+    uint32_t pool_region_start = ovl_compute_pool_region_start(decomp, decomp_size, arc, version);
     uint32_t pool_region_sz = (arc->pools_end >= arc->pools_start) ? (arc->pools_end - arc->pools_start) : 0;
 
-    /* Pools */
     ovl_pool_t *pools = NULL;
     int pool_count = 0;
-    if (ovl_parse_mempools(decomp, decomp_size, arc, version, &pools, &pool_count)) {
-        int unknown_idx = 0;
+    ovl_parse_mempools(decomp, decomp_size, arc, version, &pools, &pool_count);
+
+    /* DataEntries read upfront: files whose real content lives in a buffer
+       must not also be emitted (with a wrong/incomplete reference stub)
+       from their pool entry. */
+    ovl_data_entry_t *data_entries = NULL;
+    int data_count = 0;
+    if (arc->num_datas > 0) {
+        ovl_parse_data_entries(decomp, decomp_size, arc, version, &data_entries, &data_count);
+    }
+
+    int unknown_idx = 0;
+
+    if (arc->num_root_entries > 0 && pools) {
+        ovl_root_entry_t *root_entries = NULL; int root_count = 0;
+        ovl_fragment_t *fragments = NULL; int frag_count = 0;
+        ovl_parse_root_entries(decomp, decomp_size, arc, version, &root_entries, &root_count);
+        ovl_parse_fragments(decomp, decomp_size, arc, version, &fragments, &frag_count);
+
+        ovl_fragment_t *frags_sorted = NULL;
+        if (frag_count > 0) {
+            frags_sorted = (ovl_fragment_t *)malloc((size_t)frag_count * sizeof(ovl_fragment_t));
+            if (frags_sorted) {
+                memcpy(frags_sorted, fragments, (size_t)frag_count * sizeof(ovl_fragment_t));
+                qsort(frags_sorted, (size_t)frag_count, sizeof(ovl_fragment_t), cmp_fragment_by_link);
+            }
+        }
+        growbuf_t synth = {0};
+
+        ovl_sub_file_t *subs = NULL; int sub_count = 0;
+        if (ovl_resolve_pool_sub_files(pools, pool_count, root_entries, root_count,
+                                        fragments, frag_count, &subs, &sub_count)) {
+            for (int i = 0; i < sub_count; i++) {
+                int in_data_entries = 0;
+                for (int d = 0; d < data_count; d++) {
+                    if (data_entries[d].file_hash == subs[i].file_hash) { in_data_entries = 1; break; }
+                }
+                if (in_data_entries) continue; /* real content comes from a buffer, see below */
+
+                const ovl_file_t *sub_finfo = ovl_find_file_by_hash(&ctx->header, subs[i].file_hash);
+
+                if (sub_finfo && strcmp(sub_finfo->ext, "Casino:AssetPackageRes:assetpkg") == 0 && frags_sorted) {
+                    /* pools[subs[i].pool_index] + subs[i].offset is exactly this
+                       occurrence's RootEntry (pool_index, data_offset) -- using it
+                       directly (instead of a file_hash->RootEntry map) avoids picking
+                       the wrong RootEntry when the same file_hash appears multiple
+                       times with different ext (distinct resource facades of the same
+                       object, e.g. an asset that is both ...assetpkg and ...lua). */
+                    size_t out_size = 0;
+                    unsigned char *resolved = resolve_assetpkg(decomp, decomp_size, pools, pool_count,
+                                                                pool_region_start, frags_sorted, frag_count,
+                                                                subs[i].pool_index, (uint32_t)subs[i].offset, &out_size);
+                    if (resolved) {
+                        uint64_t off = growbuf_append(&synth, resolved, out_size);
+                        free(resolved);
+                        if (off != (uint64_t)-1) {
+                            char full[400];
+                            name_for_hash(&ctx->header, 1, subs[i].file_hash, synth.data + off, out_size,
+                                          "unknown", &unknown_idx, full, sizeof(full));
+                            push_synth_entry(ctx, full, out_size, arc_idx, off);
+                            continue;
+                        }
+                    }
+                    /* Resolution failed (no matching Fragment) -- skip rather than
+                       write the meaningless raw stub. */
+                    continue;
+                }
+                if (sub_finfo && strcmp(sub_finfo->ext, "Casino:WorldDesc:world") == 0 && frags_sorted) {
+                    size_t out_size = 0;
+                    uint64_t off = resolve_worlddesc(&synth, decomp, decomp_size, pools, pool_count,
+                                                      pool_region_start, frags_sorted, frag_count,
+                                                      subs[i].pool_index, (uint32_t)subs[i].offset, &out_size);
+                    if (off != (uint64_t)-1) {
+                        char full[400];
+                        name_for_hash(&ctx->header, 1, subs[i].file_hash, synth.data + off, out_size,
+                                      "unknown", &unknown_idx, full, sizeof(full));
+                        push_synth_entry(ctx, full, out_size, arc_idx, off);
+                    }
+                    continue; /* on failure: skip rather than write the wrong raw stub */
+                }
+                if (sub_finfo && strcmp(sub_finfo->ext, "Casino:XMLConfig:xmlconfig") == 0 && frags_sorted) {
+                    size_t out_size = 0;
+                    uint64_t off = resolve_xmlconfig(&synth, decomp, decomp_size, pools, pool_count,
+                                                      pool_region_start, frags_sorted, frag_count,
+                                                      subs[i].pool_index, (uint32_t)subs[i].offset, &out_size);
+                    if (off != (uint64_t)-1) {
+                        char full[400];
+                        name_for_hash(&ctx->header, 1, subs[i].file_hash, synth.data + off, out_size,
+                                      "unknown", &unknown_idx, full, sizeof(full));
+                        push_synth_entry(ctx, full, out_size, arc_idx, off);
+                    }
+                    continue; /* on failure: skip rather than write the wrong raw stub */
+                }
+                if (sub_finfo && is_structured_data_ext(sub_finfo->ext)) continue;
+
+                int pidx = subs[i].pool_index;
+                uint64_t raw_start = (uint64_t)pool_region_start + pools[pidx].offset + subs[i].offset;
+                uint64_t start, sz;
+                py_slice_bounds(decomp_size, raw_start, subs[i].size, &start, &sz);
+                if (sz == 0) continue;
+
+                char full[400];
+                name_for_hash(&ctx->header, 1, subs[i].file_hash, decomp + start, (size_t)sz,
+                              "unknown", &unknown_idx, full, sizeof(full));
+                push_entry(ctx, full, sz, arc_idx, start);
+            }
+        }
+        ctx->synth_bufs[arc_idx] = synth.data;
+        ctx->synth_sizes[arc_idx] = synth.size;
+        free(frags_sorted);
+        free(subs);
+        free(root_entries);
+        free(fragments);
+    } else {
+        /* Simple case: one pool = one file (unchanged from before). */
         for (int i = 0; i < pool_count; i++) {
-            uint64_t raw_start = (uint64_t)set_data_size + pools[i].offset;
+            uint64_t raw_start = (uint64_t)pool_region_start + pools[i].offset;
             uint64_t start, sz;
             py_slice_bounds(decomp_size, raw_start, pools[i].size, &start, &sz);
             if (sz == 0) continue;
-
-            const ovl_file_t *finfo = ovl_find_file_by_hash(&ctx->header, pools[i].file_hash);
             char full[400];
-
-            if (finfo) {
-                char name_buf[280];
-                char ext_buf[100];
-                strncpy(name_buf, finfo->name, sizeof(name_buf) - 1); name_buf[sizeof(name_buf) - 1] = '\0';
-                ovl_sanitize(name_buf);
-                strncpy(ext_buf, finfo->ext, sizeof(ext_buf) - 1); ext_buf[sizeof(ext_buf) - 1] = '\0';
-                if (ext_buf[0] != '\0' && ext_buf[0] != '.') {
-                    char tmp[100];
-                    ovl_sanitize(ext_buf);
-                    _snprintf(tmp, sizeof(tmp) - 1, ".%s", ext_buf);
-                    tmp[sizeof(tmp) - 1] = '\0';
-                    strncpy(ext_buf, tmp, sizeof(ext_buf) - 1); ext_buf[sizeof(ext_buf) - 1] = '\0';
-                } else {
-                    ovl_sanitize(ext_buf);
-                }
-                _snprintf(full, sizeof(full) - 1, "%s%s", name_buf, ext_buf);
-                full[sizeof(full) - 1] = '\0';
-            } else {
-                const char *detected = ovl_detect_ext(decomp + start, (size_t)sz);
-                const char *ext = detected ? detected : ".bin";
-                _snprintf(full, sizeof(full) - 1, "unknown-%04d%s", unknown_idx++, ext);
-                full[sizeof(full) - 1] = '\0';
-            }
-
+            name_for_hash(&ctx->header, 1, pools[i].file_hash, decomp + start, (size_t)sz,
+                          "unknown", &unknown_idx, full, sizeof(full));
             push_entry(ctx, full, sz, arc_idx, start);
         }
     }
     free(pools);
 
-    /* Buffers (bulk data: texture mips, model vertices, ...) */
+    /* Buffers (bulk data: texture mips, model vertices, Lua modules, ...) */
     if (arc->num_buffers > 0) {
         uint32_t *sizes = NULL;
         int sizes_count = 0;
         int parse_ok = ovl_parse_buffer_sizes(decomp, decomp_size, arc, version, &sizes, &sizes_count);
-        DBG("  buf-parse: ok=%d count=%d pool_region_sz=%u set_data_size=%u decomp_size=%zu\n",
-            parse_ok, sizes_count, pool_region_sz, set_data_size, decomp_size);
+        DBG("  buf-parse: ok=%d count=%d pool_region_sz=%u pool_region_start=%u decomp_size=%zu\n",
+            parse_ok, sizes_count, pool_region_sz, pool_region_start, decomp_size);
         if (parse_ok) {
-            uint64_t pos = (uint64_t)set_data_size + pool_region_sz;
+            uint32_t *buffer_hash = NULL;
+            int *buffer_hash_found = NULL;
+            if (arc->num_datas > 0 && sizes_count > 0) {
+                buffer_hash = (uint32_t *)calloc((size_t)sizes_count, sizeof(uint32_t));
+                buffer_hash_found = (int *)calloc((size_t)sizes_count, sizeof(int));
+                ovl_buffer_group_t *groups = NULL;
+                int group_count = 0;
+                ovl_parse_buffer_groups(decomp, decomp_size, arc, version, &groups, &group_count);
+                if (buffer_hash && buffer_hash_found) {
+                    ovl_resolve_buffer_names(data_entries, data_count, groups, group_count,
+                                              sizes_count, buffer_hash, buffer_hash_found);
+                }
+                free(groups);
+            }
+
+            uint64_t pos = (uint64_t)pool_region_start + pool_region_sz;
+            int buf_unknown_idx = 0;
             for (int i = 0; i < sizes_count; i++) {
                 uint64_t raw_bsz = sizes[i];
                 uint64_t start, sz;
                 py_slice_bounds(decomp_size, pos, raw_bsz, &start, &sz);
                 DBG("    buf[%d] raw_size=%u pos=%llu -> sz=%llu\n", i, sizes[i], (unsigned long long)pos, (unsigned long long)sz);
                 if (sz > 0) {
-                    const char *detected = ovl_detect_ext(decomp + start, (size_t)sz);
-                    const char *ext = detected ? detected : ".bin";
                     char full[160];
-                    _snprintf(full, sizeof(full) - 1, "%s_buf%03d%s", arc->name, i, ext);
-                    full[sizeof(full) - 1] = '\0';
+                    if (buffer_hash_found && buffer_hash_found[i]) {
+                        char prefix[96];
+                        _snprintf(prefix, sizeof(prefix) - 1, "%s_unknown", arc->name);
+                        prefix[sizeof(prefix) - 1] = '\0';
+                        name_for_hash(&ctx->header, 1, buffer_hash[i], decomp + start, (size_t)sz,
+                                      prefix, &buf_unknown_idx, full, sizeof(full));
+                    } else {
+                        const char *detected = ovl_detect_ext(decomp + start, (size_t)sz);
+                        const char *ext = detected ? detected : ".bin";
+                        _snprintf(full, sizeof(full) - 1, "%s_buf%03d%s", arc->name, i, ext);
+                        full[sizeof(full) - 1] = '\0';
+                    }
                     push_entry(ctx, full, sz, arc_idx, start);
                 }
                 pos += raw_bsz; /* unclamped advance, see comment above on slice semantics */
             }
+            free(buffer_hash);
+            free(buffer_hash_found);
         }
         free(sizes);
     }
+    free(data_entries);
+}
+
+/* Ensures the plugin's Oodle handle is loaded (searching upward from the
+   .ovl's directory, then next to the plugin DLL itself as a fallback). */
+static int ensure_oodle_loaded(ovl_wcx_handle_t *ctx, const wchar_t *dir_w) {
+    if (!ctx->oodle_tried) {
+        ctx->oodle_tried = 1;
+        /* oo2core_*.dll usually sits in the game's install root, while .ovl
+           files can be nested very deep (e.g. 9 levels below the root in
+           JWE2) -- so search generously in parent directories too. */
+        ctx->oodle_ok = ovl_oodle_load_upward(dir_w, 16, &ctx->oodle);
+
+        /* Fallback: next to the plugin DLL itself. Lets a copy of
+           oo2core_*.dll dropped into the plugin folder work for any .ovl,
+           even outside a full game installation (e.g. a standalone test
+           file). */
+        if (!ctx->oodle_ok) {
+            wchar_t plugin_dir[MAX_PATH];
+            if (get_plugin_dir(plugin_dir, MAX_PATH)) {
+                ctx->oodle_ok = ovl_oodle_load(plugin_dir, &ctx->oodle);
+                if (ctx->oodle_ok) DBG("  -> Oodle DLL found next to the plugin: %ls\n", plugin_dir);
+            }
+        }
+    }
+    return ctx->oodle_ok;
+}
+
+/* Decompresses a compressed blob (STATIC data, or a compressed OVS batch
+   file) according to the archive's compression flag. Returns a malloc'd
+   buffer (caller frees) on success, NULL on failure. */
+static unsigned char *decompress_blob(ovl_wcx_handle_t *ctx, const wchar_t *dir_w,
+                                       const unsigned char *compressed, uint32_t cs,
+                                       uint64_t uncompressed_size, size_t *out_size) {
+    *out_size = 0;
+    if (ctx->header.compression == OVL_COMPRESSION_OODLE) {
+        if (!ensure_oodle_loaded(ctx, dir_w)) {
+            DBG("  -> Oodle DLL not found (also not in parent directories of %ls, nor next to the plugin)\n", dir_w);
+            return NULL;
+        }
+        if (uncompressed_size == 0 || uncompressed_size > 0xFFFFFFFFull) { DBG("  -> invalid uncompressed_size\n"); return NULL; }
+        unsigned char *decomp = (unsigned char *)malloc((size_t)uncompressed_size);
+        if (!decomp) return NULL;
+        if (!ovl_oodle_decompress(&ctx->oodle, compressed, cs, decomp, (size_t)uncompressed_size)) {
+            DBG("  -> Oodle decompression failed\n");
+            free(decomp);
+            return NULL;
+        }
+        *out_size = (size_t)uncompressed_size;
+        return decomp;
+    } else if (ctx->header.compression == OVL_COMPRESSION_ZLIB) {
+        if (cs < 2) return NULL;
+        if (uncompressed_size == 0 || uncompressed_size > 0xFFFFFFFFull) { DBG("  -> invalid uncompressed_size\n"); return NULL; }
+        unsigned char *decomp = (unsigned char *)malloc((size_t)uncompressed_size);
+        if (!decomp) return NULL;
+        if (!ovl_zlib_inflate_raw(compressed + 2, cs - 2, decomp, (size_t)uncompressed_size)) {
+            DBG("  -> ZLIB decompression failed (cs=%u out=%llu)\n", cs, (unsigned long long)uncompressed_size);
+            free(decomp);
+            return NULL;
+        }
+        *out_size = (size_t)uncompressed_size;
+        return decomp;
+    }
+    return NULL; /* NONE/unknown: caller should use the raw bytes directly */
 }
 
 /* Decompresses/loads a single archive (STATIC or OVS) and appends its
@@ -299,46 +1084,14 @@ static void process_archive(ovl_wcx_handle_t *ctx, int arc_idx,
 
         const unsigned char *compressed = ctx->raw + ctx->header.data_start;
 
-        if (ctx->header.compression == OVL_COMPRESSION_OODLE) {
-            if (!ctx->oodle_tried) {
-                ctx->oodle_tried = 1;
-                /* oo2core_*.dll usually sits in the game's install root, while
-                   .ovl files can be nested very deep (e.g. 9 levels below the
-                   root in JWE2) -- so search generously in parent directories
-                   too. */
-                ctx->oodle_ok = ovl_oodle_load_upward(dir_w, 16, &ctx->oodle);
-            }
-            if (!ctx->oodle_ok) { DBG("  -> Oodle DLL not found (also not in parent directories of %ls)\n", dir_w); return; }
-
-            uint64_t out_size64 = arc->uncompressed_size;
-            if (out_size64 == 0 || out_size64 > 0xFFFFFFFFull) { DBG("  -> invalid uncompressed_size\n"); return; }
-            decomp = (unsigned char *)malloc((size_t)out_size64);
-            if (!decomp) return;
-            if (!ovl_oodle_decompress(&ctx->oodle, compressed, cs, decomp, (size_t)out_size64)) {
-                DBG("  -> Oodle decompression failed\n");
-                free(decomp);
-                return;
-            }
-            decomp_size = (size_t)out_size64;
-            owns = 1;
-        } else if (ctx->header.compression == OVL_COMPRESSION_ZLIB) {
-            if (cs < 2) return;
-            uint64_t out_size64 = arc->uncompressed_size;
-            if (out_size64 == 0 || out_size64 > 0xFFFFFFFFull) { DBG("  -> invalid uncompressed_size\n"); return; }
-            decomp = (unsigned char *)malloc((size_t)out_size64);
-            if (!decomp) return;
-            if (!ovl_zlib_inflate_raw(compressed + 2, cs - 2, decomp, (size_t)out_size64)) {
-                DBG("  -> ZLIB decompression failed (cs=%u out=%llu)\n", cs, (unsigned long long)out_size64);
-                free(decomp);
-                return;
-            }
-            decomp_size = (size_t)out_size64;
-            owns = 1;
-        } else {
-            /* NONE / unknown: use the raw bytes directly */
+        if (ctx->header.compression == OVL_COMPRESSION_NONE) {
             decomp = (unsigned char *)compressed;
             decomp_size = cs;
             owns = 0;
+        } else {
+            decomp = decompress_blob(ctx, dir_w, compressed, cs, arc->uncompressed_size, &decomp_size);
+            if (!decomp) return;
+            owns = 1;
         }
     } else {
         char arcname_lower[64];
@@ -362,8 +1115,25 @@ static void process_archive(ovl_wcx_handle_t *ctx, int arc_idx,
         }
 
         DBG("  -> OVS found: %ls\n", chosen);
-        if (!read_whole_file_w(chosen, &decomp, &decomp_size)) { DBG("  -> failed to read OVS\n"); return; }
-        owns = 1;
+        unsigned char *raw_ovs = NULL;
+        size_t raw_ovs_size = 0;
+        if (!read_whole_file_w(chosen, &raw_ovs, &raw_ovs_size)) { DBG("  -> failed to read OVS\n"); return; }
+
+        /* OVS batch files are usually stored uncompressed, but some are
+           still compressed (raw size matches compressed_size instead of
+           uncompressed_size) -- detect and decompress accordingly. */
+        if (raw_ovs_size == arc->compressed_size && arc->uncompressed_size != 0 &&
+            arc->uncompressed_size != raw_ovs_size && ctx->header.compression != OVL_COMPRESSION_NONE) {
+            decomp = decompress_blob(ctx, dir_w, raw_ovs, (uint32_t)raw_ovs_size, arc->uncompressed_size, &decomp_size);
+            free(raw_ovs);
+            if (!decomp) { DBG("  -> OVS was compressed but decompression failed\n"); return; }
+            DBG("  -> OVS was compressed, decompressed to %zu bytes\n", decomp_size);
+            owns = 1;
+        } else {
+            decomp = raw_ovs;
+            decomp_size = raw_ovs_size;
+            owns = 1;
+        }
     }
 
     ctx->decomp_bufs[arc_idx] = decomp;
@@ -439,8 +1209,11 @@ HANDLE __stdcall OpenArchiveW(tOpenArchiveDataW *ArchiveData) {
     ctx->decomp_bufs = (unsigned char **)calloc(header.num_archives ? header.num_archives : 1, sizeof(unsigned char *));
     ctx->decomp_sizes = (size_t *)calloc(header.num_archives ? header.num_archives : 1, sizeof(size_t));
     ctx->owns_buf = (int *)calloc(header.num_archives ? header.num_archives : 1, sizeof(int));
-    if (!ctx->decomp_bufs || !ctx->decomp_sizes || !ctx->owns_buf) {
+    ctx->synth_bufs = (unsigned char **)calloc(header.num_archives ? header.num_archives : 1, sizeof(unsigned char *));
+    ctx->synth_sizes = (size_t *)calloc(header.num_archives ? header.num_archives : 1, sizeof(size_t));
+    if (!ctx->decomp_bufs || !ctx->decomp_sizes || !ctx->owns_buf || !ctx->synth_bufs || !ctx->synth_sizes) {
         free(ctx->decomp_bufs); free(ctx->decomp_sizes); free(ctx->owns_buf);
+        free(ctx->synth_bufs); free(ctx->synth_sizes);
         ovl_free_header(&ctx->header);
         free(ctx->raw);
         free(ctx);
@@ -570,8 +1343,8 @@ int __stdcall ProcessFileW(HANDLE hArcData, int Operation, wchar_t *DestPath, wc
     HANDLE f = CreateFileW(long_path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (f == INVALID_HANDLE_VALUE) return E_ECREATE;
 
-    unsigned char *buf = ctx->decomp_bufs[e->archive_index];
-    size_t buf_size = ctx->decomp_sizes[e->archive_index];
+    unsigned char *buf = e->is_synth ? ctx->synth_bufs[e->archive_index] : ctx->decomp_bufs[e->archive_index];
+    size_t buf_size = e->is_synth ? ctx->synth_sizes[e->archive_index] : ctx->decomp_sizes[e->archive_index];
     if (!buf || e->data_offset + e->size > buf_size) {
         CloseHandle(f);
         return E_BAD_DATA;
@@ -632,9 +1405,16 @@ int __stdcall CloseArchive(HANDLE hArcData) {
             if (ctx->owns_buf && ctx->owns_buf[i] && ctx->decomp_bufs[i]) free(ctx->decomp_bufs[i]);
         }
     }
+    if (ctx->synth_bufs) {
+        for (int i = 0; i < ctx->header.num_archives; i++) {
+            free(ctx->synth_bufs[i]);
+        }
+    }
     free(ctx->decomp_bufs);
     free(ctx->decomp_sizes);
     free(ctx->owns_buf);
+    free(ctx->synth_bufs);
+    free(ctx->synth_sizes);
     free(ctx->entries);
     ovl_free_header(&ctx->header);
     free(ctx->raw);
@@ -660,6 +1440,7 @@ int __stdcall GetPackerCaps(void) {
 BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved) {
     (void)reserved;
     if (reason == DLL_PROCESS_ATTACH) {
+        g_hinst = hinst;
         DisableThreadLibraryCalls(hinst);
     }
     return TRUE;

@@ -342,6 +342,356 @@ int ovl_parse_buffer_sizes(const unsigned char *decomp, size_t decomp_size,
     return 1;
 }
 
+/* ---- Extended layout: DataEntry / BufferGroup / RootEntry / Fragment -------- *
+ *
+ * Struct order inside the decompressed archive:
+ *   [pool_groups][pools][data_entries][buffer_entries][buffer_groups]
+ *   [root_entries][fragments][set_header]
+ *   -> only then the pools' own raw data, followed by the buffers' raw data.
+ *
+ * For simple archives (num_datas=0, num_root_entries=0, num_fragments=0) this
+ * whole prefix is tiny and coincides with set_data_size -- the original
+ * simple pool/buffer logic remains unchanged for that case. When these
+ * tables are populated (e.g. Init.ovl bundling hundreds of files per pool),
+ * the full prefix must be accounted for or every offset points nowhere. */
+
+typedef struct {
+    size_t data_entries, buffer_entries, buffer_groups, root_entries, fragments, set_header;
+    size_t re_sz, fr_sz, de_sz, bg_sz;
+} ovl_table_offsets_t;
+
+static void table_offsets(const ovl_archive_t *arc, int version, ovl_table_offsets_t *o) {
+    size_t pg_sz, mp_sz, de_sz, be_sz;
+    struct_sizes(version, &pg_sz, &mp_sz, &de_sz, &be_sz);
+    o->bg_sz = 32;
+    o->re_sz = (version >= 19) ? 16 : 12;
+    o->fr_sz = 16;
+    o->de_sz = de_sz;
+
+    o->data_entries  = (size_t)arc->num_pool_groups * pg_sz + (size_t)arc->num_pools * mp_sz;
+    o->buffer_entries = o->data_entries + (size_t)arc->num_datas * de_sz;
+    o->buffer_groups   = o->buffer_entries + (size_t)arc->num_buffers * be_sz;
+    o->root_entries     = o->buffer_groups + (size_t)arc->num_buffer_groups * o->bg_sz;
+    o->fragments          = o->root_entries + (size_t)arc->num_root_entries * o->re_sz;
+    o->set_header            = o->fragments + (size_t)arc->num_fragments * o->fr_sz;
+}
+
+uint32_t ovl_compute_pool_region_start(const unsigned char *decomp, size_t decomp_size,
+                                        const ovl_archive_t *arc, int version) {
+    if (arc->num_datas == 0 && arc->num_root_entries == 0 && arc->num_fragments == 0) {
+        return arc->set_data_size;
+    }
+
+    ovl_table_offsets_t off;
+    table_offsets(arc, version, &off);
+
+    uint32_t set_count, asset_count;
+    if (!rd_u32(decomp, decomp_size, off.set_header, &set_count) ||
+        !rd_u32(decomp, decomp_size, off.set_header + 4, &asset_count)) {
+        return arc->set_data_size;
+    }
+    size_t set_entry_sz   = (version >= 19) ? 12 : 8;
+    size_t asset_entry_sz = (version >= 19) ? 24 : 16;
+    size_t set_header_size = 16 + (size_t)set_count * set_entry_sz + (size_t)asset_count * asset_entry_sz;
+    size_t result = off.set_header + set_header_size;
+
+    /* Sanity/safety net: a corrupt or unexpectedly-laid-out archive (e.g. a
+       compressed OVS batch mistakenly treated as already decompressed) could
+       otherwise produce a wild offset here. All callers bounds-check against
+       decomp_size before dereferencing, but falling back cleanly avoids
+       building an unusable (and confusing) pool_region_start in the first
+       place. */
+    if (result > decomp_size || result > 0xFFFFFFFFull) {
+        return arc->set_data_size;
+    }
+    return (uint32_t)result;
+}
+
+int ovl_parse_root_entries(const unsigned char *decomp, size_t decomp_size,
+                            const ovl_archive_t *arc, int version,
+                            ovl_root_entry_t **out_entries, int *out_count) {
+    *out_entries = NULL;
+    *out_count = 0;
+    if (arc->num_root_entries == 0) return 1;
+    if (arc->num_root_entries > OVL_MAX_COUNT) return 0;
+
+    ovl_table_offsets_t off;
+    table_offsets(arc, version, &off);
+
+    ovl_root_entry_t *entries = (ovl_root_entry_t *)calloc(arc->num_root_entries, sizeof(ovl_root_entry_t));
+    if (!entries) return 0;
+
+    for (uint32_t i = 0; i < arc->num_root_entries; i++) {
+        size_t o = off.root_entries + (size_t)i * off.re_sz;
+        uint32_t file_hash = 0, ext_hash = 0, data_offset = 0;
+        int32_t pool_index = -1;
+        int ok;
+        if (version >= 19) {
+            uint32_t raw_pool_index;
+            ok = rd_u32(decomp, decomp_size, o, &file_hash) &&
+                 rd_u32(decomp, decomp_size, o + 4, &ext_hash) &&
+                 rd_u32(decomp, decomp_size, o + 8, &raw_pool_index) &&
+                 rd_u32(decomp, decomp_size, o + 12, &data_offset);
+            pool_index = (int32_t)raw_pool_index;
+        } else {
+            uint32_t raw_pool_index;
+            ok = rd_u32(decomp, decomp_size, o, &file_hash) &&
+                 rd_u32(decomp, decomp_size, o + 4, &raw_pool_index) &&
+                 rd_u32(decomp, decomp_size, o + 8, &data_offset);
+            pool_index = (int32_t)raw_pool_index;
+        }
+        if (!ok) { free(entries); return 0; }
+        entries[i].file_hash = file_hash;
+        entries[i].ext_hash = ext_hash;
+        entries[i].pool_index = pool_index;
+        entries[i].data_offset = data_offset;
+    }
+
+    *out_entries = entries;
+    *out_count = (int)arc->num_root_entries;
+    return 1;
+}
+
+int ovl_parse_fragments(const unsigned char *decomp, size_t decomp_size,
+                         const ovl_archive_t *arc, int version,
+                         ovl_fragment_t **out_fragments, int *out_count) {
+    *out_fragments = NULL;
+    *out_count = 0;
+    if (arc->num_fragments == 0) return 1;
+    if (arc->num_fragments > OVL_MAX_COUNT) return 0;
+
+    ovl_table_offsets_t off;
+    table_offsets(arc, version, &off);
+
+    ovl_fragment_t *fragments = (ovl_fragment_t *)calloc(arc->num_fragments, sizeof(ovl_fragment_t));
+    if (!fragments) return 0;
+
+    for (uint32_t i = 0; i < arc->num_fragments; i++) {
+        size_t o = off.fragments + (size_t)i * off.fr_sz;
+        uint32_t link_pool, link_offset, struct_pool, struct_offset;
+        if (!rd_u32(decomp, decomp_size, o, &link_pool) ||
+            !rd_u32(decomp, decomp_size, o + 4, &link_offset) ||
+            !rd_u32(decomp, decomp_size, o + 8, &struct_pool) ||
+            !rd_u32(decomp, decomp_size, o + 12, &struct_offset)) {
+            free(fragments);
+            return 0;
+        }
+        fragments[i].link_pool = (int32_t)link_pool;
+        fragments[i].link_offset = link_offset;
+        fragments[i].struct_pool = (int32_t)struct_pool;
+        fragments[i].struct_offset = struct_offset;
+    }
+
+    *out_fragments = fragments;
+    *out_count = (int)arc->num_fragments;
+    return 1;
+}
+
+int ovl_parse_data_entries(const unsigned char *decomp, size_t decomp_size,
+                            const ovl_archive_t *arc, int version,
+                            ovl_data_entry_t **out_entries, int *out_count) {
+    *out_entries = NULL;
+    *out_count = 0;
+    if (arc->num_datas == 0) return 1;
+    if (arc->num_datas > OVL_MAX_COUNT) return 0;
+
+    ovl_table_offsets_t off;
+    table_offsets(arc, version, &off);
+
+    ovl_data_entry_t *entries = (ovl_data_entry_t *)calloc(arc->num_datas, sizeof(ovl_data_entry_t));
+    if (!entries) return 0;
+
+    for (uint32_t i = 0; i < arc->num_datas; i++) {
+        size_t o = off.data_entries + (size_t)i * off.de_sz;
+        uint32_t file_hash;
+        uint16_t buffer_count;
+        uint64_t size_1, size_2;
+        int ok;
+        if (version >= 19) {
+            uint16_t set_index;
+            ok = rd_u32(decomp, decomp_size, o, &file_hash) &&
+                 rd_u16(decomp, decomp_size, o + 8, &set_index) &&
+                 rd_u16(decomp, decomp_size, o + 10, &buffer_count) &&
+                 rd_u64(decomp, decomp_size, o + 16, &size_1) &&
+                 rd_u64(decomp, decomp_size, o + 24, &size_2);
+        } else {
+            uint16_t set_index;
+            ok = rd_u32(decomp, decomp_size, o, &file_hash) &&
+                 rd_u16(decomp, decomp_size, o + 4, &set_index) &&
+                 rd_u16(decomp, decomp_size, o + 6, &buffer_count) &&
+                 rd_u64(decomp, decomp_size, o + 8, &size_1) &&
+                 rd_u64(decomp, decomp_size, o + 16, &size_2);
+        }
+        if (!ok) { free(entries); return 0; }
+        entries[i].file_hash = file_hash;
+        entries[i].buffer_count = buffer_count;
+        entries[i].size_1 = size_1;
+        entries[i].size_2 = size_2;
+    }
+
+    *out_entries = entries;
+    *out_count = (int)arc->num_datas;
+    return 1;
+}
+
+int ovl_parse_buffer_groups(const unsigned char *decomp, size_t decomp_size,
+                             const ovl_archive_t *arc, int version,
+                             ovl_buffer_group_t **out_groups, int *out_count) {
+    *out_groups = NULL;
+    *out_count = 0;
+    if (arc->num_buffer_groups == 0) return 1;
+    if (arc->num_buffer_groups > OVL_MAX_COUNT) return 0;
+
+    ovl_table_offsets_t off;
+    table_offsets(arc, version, &off);
+
+    ovl_buffer_group_t *groups = (ovl_buffer_group_t *)calloc(arc->num_buffer_groups, sizeof(ovl_buffer_group_t));
+    if (!groups) return 0;
+
+    for (uint32_t i = 0; i < arc->num_buffer_groups; i++) {
+        size_t o = off.buffer_groups + (size_t)i * off.bg_sz;
+        uint32_t buffer_offset, buffer_count, ext_index, buffer_index, data_offset, data_count;
+        uint64_t size;
+        if (!rd_u32(decomp, decomp_size, o, &buffer_offset) ||
+            !rd_u32(decomp, decomp_size, o + 4, &buffer_count) ||
+            !rd_u32(decomp, decomp_size, o + 8, &ext_index) ||
+            !rd_u32(decomp, decomp_size, o + 12, &buffer_index) ||
+            !rd_u64(decomp, decomp_size, o + 16, &size) ||
+            !rd_u32(decomp, decomp_size, o + 24, &data_offset) ||
+            !rd_u32(decomp, decomp_size, o + 28, &data_count)) {
+            free(groups);
+            return 0;
+        }
+        groups[i].buffer_offset = buffer_offset;
+        groups[i].buffer_count = buffer_count;
+        groups[i].data_offset = data_offset;
+        groups[i].data_count = data_count;
+    }
+
+    *out_groups = groups;
+    *out_count = (int)arc->num_buffer_groups;
+    return 1;
+}
+
+/* Internal: dynamic set of unique uint64 offsets per pool (sorted insert). */
+typedef struct {
+    uint64_t *vals;
+    int count, capacity;
+} ovl_offset_set_t;
+
+static void offset_set_add(ovl_offset_set_t *s, uint64_t v) {
+    for (int i = 0; i < s->count; i++) if (s->vals[i] == v) return;
+    if (s->count >= s->capacity) {
+        int new_cap = s->capacity ? s->capacity * 2 : 8;
+        uint64_t *n = (uint64_t *)realloc(s->vals, (size_t)new_cap * sizeof(uint64_t));
+        if (!n) return;
+        s->vals = n;
+        s->capacity = new_cap;
+    }
+    s->vals[s->count++] = v;
+}
+
+static int cmp_u64(const void *a, const void *b) {
+    uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+    return (x > y) - (x < y);
+}
+
+int ovl_resolve_pool_sub_files(const ovl_pool_t *pools, int pool_count,
+                                const ovl_root_entry_t *root_entries, int root_count,
+                                const ovl_fragment_t *fragments, int fragment_count,
+                                ovl_sub_file_t **out_entries, int *out_count) {
+    *out_entries = NULL;
+    *out_count = 0;
+    if (pool_count <= 0) return 1;
+
+    ovl_offset_set_t *sets = (ovl_offset_set_t *)calloc((size_t)pool_count, sizeof(ovl_offset_set_t));
+    if (!sets) return 0;
+
+    for (int i = 0; i < root_count; i++) {
+        int32_t pidx = root_entries[i].pool_index;
+        if (pidx >= 0 && pidx < pool_count) {
+            offset_set_add(&sets[pidx], root_entries[i].data_offset);
+        }
+    }
+    for (int i = 0; i < fragment_count; i++) {
+        int32_t pidx = fragments[i].struct_pool;
+        if (pidx >= 0 && pidx < pool_count && fragments[i].struct_offset != pools[pidx].size) {
+            offset_set_add(&sets[pidx], fragments[i].struct_offset);
+        }
+    }
+
+    int cap = 64, count = 0;
+    ovl_sub_file_t *result = (ovl_sub_file_t *)calloc((size_t)cap, sizeof(ovl_sub_file_t));
+    if (!result) { for (int i = 0; i < pool_count; i++) free(sets[i].vals); free(sets); return 0; }
+
+    for (int p = 0; p < pool_count; p++) {
+        if (sets[p].count == 0) continue;
+        qsort(sets[p].vals, (size_t)sets[p].count, sizeof(uint64_t), cmp_u64);
+
+        for (int j = 0; j < sets[p].count; j++) {
+            uint64_t o = sets[p].vals[j];
+            uint64_t next = (j + 1 < sets[p].count) ? sets[p].vals[j + 1] : pools[p].size;
+            if (next <= o) continue;
+
+            /* Only emit entries that have an associated file_hash (from a
+               RootEntry) -- Fragment-only offsets just refine boundaries. */
+            int found = 0;
+            uint32_t fh = 0;
+            for (int i = 0; i < root_count; i++) {
+                if (root_entries[i].pool_index == p && root_entries[i].data_offset == o) {
+                    found = 1;
+                    fh = root_entries[i].file_hash;
+                    break;
+                }
+            }
+            if (!found) continue;
+
+            if (count >= cap) {
+                cap *= 2;
+                ovl_sub_file_t *n = (ovl_sub_file_t *)realloc(result, (size_t)cap * sizeof(ovl_sub_file_t));
+                if (!n) { free(result); for (int i = 0; i < pool_count; i++) free(sets[i].vals); free(sets); return 0; }
+                result = n;
+            }
+            result[count].pool_index = p;
+            result[count].offset = o;
+            result[count].size = next - o;
+            result[count].file_hash = fh;
+            result[count].has_hash = 1;
+            count++;
+        }
+    }
+
+    for (int i = 0; i < pool_count; i++) free(sets[i].vals);
+    free(sets);
+
+    *out_entries = result;
+    *out_count = count;
+    return 1;
+}
+
+void ovl_resolve_buffer_names(const ovl_data_entry_t *data_entries, int data_count,
+                               const ovl_buffer_group_t *buffer_groups, int group_count,
+                               int num_buffers,
+                               uint32_t *buffer_hash, int *buffer_hash_found) {
+    for (int i = 0; i < num_buffers; i++) buffer_hash_found[i] = 0;
+
+    for (int g = 0; g < group_count; g++) {
+        const ovl_buffer_group_t *bg = &buffer_groups[g];
+        uint32_t buf_idx = bg->buffer_offset;
+        for (uint32_t k = bg->data_offset; k < bg->data_offset + bg->data_count; k++) {
+            if ((int)k >= data_count) break;
+            const ovl_data_entry_t *de = &data_entries[k];
+            for (uint16_t n = 0; n < de->buffer_count; n++) {
+                if ((int)buf_idx < num_buffers) {
+                    buffer_hash[buf_idx] = de->file_hash;
+                    buffer_hash_found[buf_idx] = 1;
+                }
+                buf_idx++;
+            }
+        }
+    }
+}
+
 /* ---- ZLIB raw deflate decompression ------------------------------------------ */
 
 int ovl_zlib_inflate_raw(const unsigned char *src, size_t src_size,

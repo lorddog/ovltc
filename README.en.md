@@ -21,8 +21,10 @@ contained resources — no Python or other runtime required.
   - ZLIB (raw deflate; the game-specific 2-byte header is skipped)
   - Oodle (`oo2core_*win64.dll`), automatically located at runtime in the
     directory of the opened `.ovl` file and up to 16 parent directories above
-    it (the DLL itself is proprietary and **not** bundled — it must come from
-    the actual game installation)
+    it, as well as a fallback right next to the plugin DLL itself (handy for
+    standalone `.ovl` files outside a full game installation) (the DLL itself
+    is proprietary and **not** bundled — it must come from the actual game
+    installation)
 - **External `.ovs` archives**: automatically discovered next to the `.ovl`
   file and merged in (SHA1/batch-database resolution is intentionally *not*
   implemented — see Limitations)
@@ -82,3 +84,15 @@ Total Commander does (via `LoadLibrary`/`GetProcAddress`) can be built with
 - The Oodle DLL is proprietary and not bundled — without it, Oodle-compressed
   archives cannot be listed/extracted (the plugin silently skips them instead
   of crashing).
+- **Known bug (unresolved format detail):** Some pools bundle several
+  independent resources back-to-back in a single memory region (observed in
+  `Config.ovl`-style XMLConfig files containing many small settings XMLs).
+  Since our parser (like the Python reference) only extracts *one* file per
+  pool, only one of the bundled resources comes out correctly named in these
+  cases; the rest are missing. So far this only affects
+  `Casino:XMLConfig:xmlconfig` files — a full scan of JWE2's entire asset tree
+  (4,750 `.ovl` files) found exactly **one** affected file. Regular assets
+  (textures, models, audio, paint jobs) are unaffected (2,400+ files tested
+  byte-identical). The exact structure that would resolve this bundling
+  (likely via the `num_fragments`/`num_root_entries` header fields) hasn't
+  been reverse-engineered yet.
