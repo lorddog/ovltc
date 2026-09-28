@@ -2,7 +2,7 @@
 
 Ein natives **Total Commander Packer-Plugin (WCX, 64-Bit)** für `.ovl`-Dateien im
 **FRES-Format der Cobra-Engine** von Frontier Developments — u. a. verwendet in
-*Elite Dangerous*, *Planet Coaster*, *Planet Zoo* und *Jurassic World Evolution 1/2*.
+*Planet Coaster*, *Planet Zoo* und *Jurassic World Evolution 1/2*.
 
 Mit dem Plugin lassen sich `.ovl`-Dateien in Total Commander wie ein gewöhnliches
 Archiv öffnen (Enter/Doppelklick), der Inhalt durchsuchen und einzelne oder alle
@@ -30,15 +30,18 @@ enthaltenen Ressourcen entpacken — ganz ohne Python oder sonstige Laufzeitumge
 - **Pool- und Buffer-Extraktion** inkl. automatischer Dateiname-Erkennung anhand
   bekannter Signaturen (DDS, PNG, Lua, OGG, FLAC, XML, JPEG, ZIP, BMP, …) für
   Ressourcen ohne Namenszuordnung
-- **Gleichnamige Dateien verschiedenen Typs** (z. B. `x.kinematic`, `x.greeble`,
-  `x.ms2`) teilen sich den Namens-Hash; RootEntries und DataEntries werden
+- **Gleichnamige Dateien verschiedenen Typs** (z. B. `x.ms2`, `x.mdl2` und
+  `x.lua`) teilen sich den Namens-Hash; RootEntries und DataEntries werden
   deshalb zusätzlich über ihren `ext_hash` zugeordnet, damit keine davon
   verdeckt oder falsch benannt wird
+- **Verweise auf andere OVLs** (Include-Einträge im Header) erscheinen oben als
+  Textdatei `Ref - <name>.ovl.txt` mit Ziel, aufgelöstem Pfad und ob die Datei
+  vorhanden ist – sonst wirkt eine OVL, die nur andere OVLs einbindet, leer
 - **Buffer je Besitzer-Datei zusammengefügt** (Zuordnung über die DataEntries:
-  v19 wie Elite Dangerous der Reihe nach, v20 über BufferGroups). Jede Datei
-  erscheint einmal unter ihrem Namen, mit allen ihren Buffern in Slot-Reihenfolge
-  hintereinander (`anaconda_large1_doorc_.ms2` = Buffer 0 + 1 + 2, `flank.lua`);
-  nur Buffer ohne Besitzer heißen noch `STATIC_bufNNN.bin`
+  v19 der Reihe nach, v20 über BufferGroups). Jede Datei erscheint einmal unter
+  ihrem Namen, mit allen ihren Buffern in Slot-Reihenfolge hintereinander
+  (`model.ms2` = Buffer 0 + 1 + 2, `script.lua`); nur Buffer ohne Besitzer
+  heißen noch `STATIC_bufNNN.bin`
 - **Windows-Long-Path-Unterstützung** (`\\?\`-Präfix): auch sehr lange
   Ressourcennamen kombiniert mit tiefen Zielordnern (> 260 Zeichen) funktionieren
   zuverlässig
@@ -46,8 +49,7 @@ enthaltenen Ressourcen entpacken — ganz ohne Python oder sonstige Laufzeitumge
 
 Das Plugin ist eine reine C-Portierung der Formatlogik aus dem mitgelieferten
 Referenzskript `unpack_ovl.py` und wurde gegen über **2.400 echte `.ovl`-Dateien**
-aus Jurassic World Evolution 2 und Elite Dangerous cross-validiert — byte-genau
-identische Ergebnisse zur Referenzimplementierung.
+cross-validiert — byte-genau identische Ergebnisse zur Referenzimplementierung.
 
 ## Installation
 

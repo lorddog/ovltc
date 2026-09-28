@@ -31,6 +31,14 @@ typedef struct {
     char name[64];
 } ovl_mime_t;
 
+/* Included OVL: another .ovl the game loads together with this one. name is
+   relative to the including .ovl's folder, without ".ovl" (e.g. "Init" or
+   "Particles\ParticleEffects"). Some OVLs consist of nothing but such
+   includes. */
+typedef struct {
+    char name[240];
+} ovl_included_t;
+
 typedef struct {
     char name[64];
     uint32_t num_pools;
@@ -58,6 +66,8 @@ typedef struct {
     int num_mimes;
     ovl_archive_t *archives;
     int num_archives;
+    ovl_included_t *included;
+    int num_included;
     uint32_t data_start;
     uint32_t num_stream_files;
 } ovl_header_t;
@@ -93,7 +103,7 @@ typedef struct {
 /* DataEntry: identifies which/how many buffers belong to a given file.
    ext_hash (v19+, 0 before) is the djb2 of the short extension (e.g. "ms2")
    and tells apart same-named files of different types, which share the
-   file_hash (e.g. "x.ms2" and "x.kinematic"). */
+   file_hash (e.g. "x.ms2" and "x.mdl2"). */
 typedef struct {
     uint32_t file_hash;
     uint32_t ext_hash;
@@ -189,10 +199,10 @@ int ovl_resolve_pool_sub_files(const ovl_pool_t *pools, int pool_count,
 /* Maps each buffer to its owning DataEntry: buffer_owner[i] is the DataEntry
    index (-1 = no known owner), buffer_sub[i] the buffer's slot within that
    entry (0..buffer_count-1, empty buffers included). With BufferGroups
-   (v20+) each group assigns its buffer_index slot. Without any (JWE/Elite
-   v19: always) the DataEntries claim the buffers in table order -- only if
-   their buffer_counts add up to num_buffers, otherwise all stay -1. Both
-   arrays must have num_buffers entries, allocated by the caller. */
+   (v20+) each group assigns its buffer_index slot. Without any (v19:
+   always) the DataEntries claim the buffers in table order -- only if their
+   buffer_counts add up to num_buffers, otherwise all stay -1. Both arrays
+   must have num_buffers entries, allocated by the caller. */
 void ovl_resolve_buffer_owners(const ovl_data_entry_t *data_entries, int data_count,
                                const ovl_buffer_group_t *buffer_groups, int group_count,
                                int num_buffers, int *buffer_owner, int *buffer_sub);

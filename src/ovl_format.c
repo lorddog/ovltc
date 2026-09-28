@@ -228,6 +228,18 @@ int ovl_parse_header(const unsigned char *data, size_t data_size,
         rd_cstr(arc_names_buf, arc_names_buf_size, name_off, a->name, sizeof(a->name));
     }
 
+    /* Included OVLs: one name offset (u32, into the names block) each, right
+       after the archive entries. Lenient: stops at the end of the file. */
+    size_t inc_start = arcs_start + (size_t)num_archives * ARCHIVE_ENTRY_SZ;
+    out->included = (ovl_included_t *)calloc(num_included_ovls ? num_included_ovls : 1, sizeof(ovl_included_t));
+    if (!out->included) return fail(errbuf, errbuf_size, "Out of memory (included OVLs)");
+    for (uint32_t i = 0; i < num_included_ovls; i++) {
+        uint32_t name_off;
+        if (!rd_u32(data, data_size, inc_start + (size_t)i * 4, &name_off)) break;
+        rd_cstr(names_buf, names_buf_size, name_off, out->included[i].name, sizeof(out->included[i].name));
+        out->num_included = (int)i + 1;
+    }
+
     size_t data_start = arcs_start
         + (size_t)num_archives * ARCHIVE_ENTRY_SZ
         + (size_t)num_included_ovls * 4
@@ -250,6 +262,7 @@ void ovl_free_header(ovl_header_t *h) {
     free(h->files);
     free(h->mimes);
     free(h->archives);
+    free(h->included);
     memset(h, 0, sizeof(*h));
 }
 
@@ -703,8 +716,8 @@ void ovl_resolve_buffer_owners(const ovl_data_entry_t *data_entries, int data_co
     for (int i = 0; i < num_buffers; i++) { buffer_owner[i] = -1; buffer_sub[i] = 0; }
 
     if (group_count == 0) {
-        /* No BufferGroups (JWE/Elite v19): the DataEntries claim the buffers
-           in table order. Verified on 4,957 Elite archives: the buffer_counts
+        /* No BufferGroups (v19): the DataEntries claim the buffers in table
+           order. Verified on 4,957 real v19 archives: the buffer_counts
            always add up to num_buffers, and each entry's buffer sizes sum to
            size_1 + size_2. Anything else is left unresolved. */
         uint64_t total = 0;

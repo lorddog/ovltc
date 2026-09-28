@@ -52,8 +52,12 @@ typedef struct {
     uint64_t data_offset;
     int is_synth;        /* 1 if data_offset/size refer to ctx->synth_bufs[archive_index]
                              instead of ctx->decomp_bufs[archive_index] (reconstructed
-                             "structured data" content, e.g. resolved .assetpkg XML) */
+                             "structured data" content, e.g. resolved .assetpkg XML);
+                             ENTRY_INFO if they refer to ctx->info_buf (generated text,
+                             e.g. the "Ref - x.ovl.txt" include notes) */
 } ovl_entry_t;
+
+#define ENTRY_INFO 2
 
 typedef struct {
     unsigned char *raw;
@@ -68,6 +72,9 @@ typedef struct {
     unsigned char **synth_bufs;   /* parallel to header.archives; reconstructed
                                      "structured data" content (always owned) */
     size_t *synth_sizes;
+
+    unsigned char *info_buf;      /* generated text entries (ENTRY_INFO), owned */
+    size_t info_size;
 
     ovl_entry_t *entries;
     int entry_count;
@@ -1113,7 +1120,7 @@ static void name_for_hash(const ovl_header_t *header, int has_hash, uint32_t fil
 
 /* Lists one file's buffers as a single entry "name.ext": the n buffers in
    bufs[] (all owned by the same DataEntry, already ordered by slot)
-   concatenated. Contiguous buffers -- always the case for v19/Elite -- are
+   concatenated. Contiguous buffers -- always the case for v19 -- are
    referenced in place; otherwise (v20 BufferGroups) they are copied into the
    archive's synth buffer. Empty files are skipped; if the plain name is
    already taken (e.g. by a pool entry), ".buffers" is appended. */
@@ -1217,7 +1224,7 @@ static void build_entries_for_archive(ovl_wcx_handle_t *ctx, int arc_idx,
                                         fragments, frag_count, &subs, &sub_count)) {
             for (int i = 0; i < sub_count; i++) {
                 /* Same-named files of different types share the file_hash
-                   (e.g. "x.kinematic" with a DataEntry next to "x.greeble"
+                   (e.g. "x.ms2" with a DataEntry next to a structured "x.xyz"
                    without one) -- compare ext_hash too where both have it. */
                 int in_data_entries = 0;
                 for (int d = 0; d < data_count; d++) {
@@ -1634,6 +1641,79 @@ static void ensure_directories_w(const wchar_t *path) {
     }
 }
 
+/* Lists one text entry "Ref - <name>.ovl.txt" per included OVL (see
+   ovl_included_t), before the archive contents -- otherwise an OVL that only
+   includes others looks empty. The text (UTF-8) names the target, its
+   resolved path next to the .ovl and whether it exists; it lives in
+   ctx->info_buf. */
+static void push_include_refs(ovl_wcx_handle_t *ctx, const wchar_t *dir_w) {
+    growbuf_t gb = {0};
+    const wchar_t *arc_file = wcsrchr(ctx->arc_path, L'\\');
+    arc_file = arc_file ? arc_file + 1 : ctx->arc_path;
+    char arc_file_u8[1024];
+    if (!WideCharToMultiByte(CP_UTF8, 0, arc_file, -1, arc_file_u8, sizeof(arc_file_u8), NULL, NULL))
+        strcpy(arc_file_u8, "?");
+
+    for (int i = 0; i < ctx->header.num_included; i++) {
+        const char *inc = ctx->header.included[i].name;
+        if (!inc[0]) continue;
+
+        wchar_t target[1400];
+        _snwprintf(target, 1399, L"%s%hs.ovl", dir_w, inc);
+        target[1399] = L'\0';
+        for (wchar_t *c = target; *c; c++) if (*c == L'/') *c = L'\\';
+        wchar_t target_long[1500];
+        to_long_path(target, target_long, 1500);
+        WIN32_FILE_ATTRIBUTE_DATA fad;
+        int exists = GetFileAttributesExW(target_long, GetFileExInfoStandard, &fad) &&
+                     !(fad.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY);
+
+        char target_u8[4096];
+        if (!WideCharToMultiByte(CP_UTF8, 0, target, -1, target_u8, sizeof(target_u8), NULL, NULL))
+            strcpy(target_u8, "?");
+        char status[64];
+        if (exists) {
+            _snprintf(status, sizeof(status) - 1, "vorhanden, %llu Byte",
+                      ((unsigned long long)fad.nFileSizeHigh << 32) | fad.nFileSizeLow);
+        } else {
+            strcpy(status, "nicht gefunden");
+        }
+        status[sizeof(status) - 1] = '\0';
+
+        char text[6000];
+        int n = _snprintf(text, sizeof(text) - 1,
+                          "\xEF\xBB\xBF"
+                          "Referenz (Include) aus %s\r\n"
+                          "Ziel:    %s.ovl\r\n"
+                          "Pfad:    %s\r\n"
+                          "Status:  %s\r\n"
+                          "\r\n"
+                          "Das Spiel l\xC3\xA4" "dt diese OVL zusammen mit %s.\r\n",
+                          arc_file_u8, inc, target_u8, status, arc_file_u8);
+        if (n <= 0) continue;
+        uint64_t off = growbuf_append(&gb, (const unsigned char *)text, (size_t)n);
+        if (off == (uint64_t)-1) break;
+
+        char flat[240];
+        strncpy(flat, inc, sizeof(flat) - 1);
+        flat[sizeof(flat) - 1] = '\0';
+        for (char *c = flat; *c; c++) if (*c == '\\' || *c == '/') *c = '_';
+        ovl_sanitize(flat);
+        char entry_name[300];
+        _snprintf(entry_name, sizeof(entry_name) - 1, "Ref - %s.ovl.txt", flat);
+        entry_name[sizeof(entry_name) - 1] = '\0';
+        for (int dup = 2; entry_name_taken(ctx, entry_name); dup++) {
+            _snprintf(entry_name, sizeof(entry_name) - 1, "Ref - %s (%d).ovl.txt", flat, dup);
+            entry_name[sizeof(entry_name) - 1] = '\0';
+        }
+        if (push_entry(ctx, entry_name, (uint64_t)n, 0, off)) {
+            ctx->entries[ctx->entry_count - 1].is_synth = ENTRY_INFO;
+        }
+    }
+    ctx->info_buf = gb.data;
+    ctx->info_size = gb.size;
+}
+
 /* ---------------------------------------------------------------------------
  * WCX interface
  * ------------------------------------------------------------------------- */
@@ -1713,6 +1793,8 @@ HANDLE __stdcall OpenArchiveW(tOpenArchiveDataW *ArchiveData) {
     _snwprintf(dir_w, 1023, L"%s%s", drive, dir_part); dir_w[1023] = 0;
     wchar_t stem_w[512];
     wcsncpy(stem_w, fname, 511); stem_w[511] = 0;
+
+    push_include_refs(ctx, dir_w);
 
     for (int i = 0; i < header.num_archives; i++) {
         process_archive(ctx, i, dir_w, stem_w);
@@ -1811,8 +1893,15 @@ int __stdcall ProcessFileW(HANDLE hArcData, int Operation, wchar_t *DestPath, wc
     HANDLE f = CreateFileW(long_path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (f == INVALID_HANDLE_VALUE) return E_ECREATE;
 
-    unsigned char *buf = e->is_synth ? ctx->synth_bufs[e->archive_index] : ctx->decomp_bufs[e->archive_index];
-    size_t buf_size = e->is_synth ? ctx->synth_sizes[e->archive_index] : ctx->decomp_sizes[e->archive_index];
+    unsigned char *buf;
+    size_t buf_size;
+    if (e->is_synth == ENTRY_INFO) {
+        buf = ctx->info_buf;
+        buf_size = ctx->info_size;
+    } else {
+        buf = e->is_synth ? ctx->synth_bufs[e->archive_index] : ctx->decomp_bufs[e->archive_index];
+        buf_size = e->is_synth ? ctx->synth_sizes[e->archive_index] : ctx->decomp_sizes[e->archive_index];
+    }
     if (!buf || e->data_offset + e->size > buf_size) {
         CloseHandle(f);
         return E_BAD_DATA;
@@ -1883,6 +1972,7 @@ int __stdcall CloseArchive(HANDLE hArcData) {
     free(ctx->owns_buf);
     free(ctx->synth_bufs);
     free(ctx->synth_sizes);
+    free(ctx->info_buf);
     free(ctx->entries);
     ovl_free_header(&ctx->header);
     free(ctx->raw);

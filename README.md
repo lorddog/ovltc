@@ -9,8 +9,7 @@ Total Commander packer plugin for `.ovl` (FRES / Cobra Engine) archive files.
 
 **ovltc** is a native Total Commander packer plugin (WCX, 64-bit) for `.ovl`
 files — the FRES archive format used by Frontier Developments' Cobra Engine
-in *Elite Dangerous*, *Planet Coaster*, *Planet Zoo*, and *Jurassic World
-Evolution 1/2*. It lets you open `.ovl` files like any other archive
+in *Planet Coaster*, *Planet Zoo*, and *Jurassic World Evolution 1/2*. It lets you open `.ovl` files like any other archive
 (Enter/double-click), browse their contents, and extract resources.
 
 - Parses the FRES header (versions 17–20+) and decompresses ZLIB- or
