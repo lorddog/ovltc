@@ -31,6 +31,14 @@ contained resources — no Python or other runtime required.
 - **Pool and buffer extraction**, including automatic filename detection via
   known signatures (DDS, PNG, Lua, OGG, FLAC, XML, JPEG, ZIP, BMP, …) for
   resources without a name mapping
+- **Same-named files of different types** (e.g. `x.kinematic`, `x.greeble`,
+  `x.ms2`) share the name hash; RootEntries and DataEntries are therefore also
+  matched by their `ext_hash`, so none of them gets hidden or misnamed
+- **Buffers merged per owning file** (assigned via the DataEntries: in table
+  order for v19 such as Elite Dangerous, via BufferGroups for v20). Each file
+  shows up once under its own name, with all its buffers concatenated in slot
+  order (`anaconda_large1_doorc_.ms2` = buffer 0 + 1 + 2, `flank.lua`); only
+  buffers without an owner are still called `STATIC_bufNNN.bin`
 - **Windows long-path support** (`\\?\` prefix): reliably handles very long
   resource names combined with deep destination folders (> 260 characters)
 - Fully **read-only** (no archive creation/modification)

@@ -216,6 +216,18 @@ static int push_synth_entry(ovl_wcx_handle_t *ctx, const char *ascii_name,
     return 1;
 }
 
+/* 1 if an entry with this name was already pushed (case-insensitive, like
+   the file system TC extracts to). */
+static int entry_name_taken(const ovl_wcx_handle_t *ctx, const char *ascii_name) {
+    wchar_t w[600];
+    ascii_to_wide(ascii_name, w, sizeof(w) / sizeof(w[0]));
+    for (wchar_t *c = w; *c; c++) if (*c == L'/') *c = L'\\';
+    for (int i = 0; i < ctx->entry_count; i++) {
+        if (_wcsicmp(ctx->entries[i].name, w) == 0) return 1;
+    }
+    return 0;
+}
+
 /* Reproduces Python-style slice semantics (decomp[start:start+len]): start
    and end are clamped to total_size instead of rejected on overflow.
    Externally loaded OVS archives don't carry a complete buffer-size table,
@@ -1051,43 +1063,87 @@ static uint64_t resolve_generic_structured(growbuf_t *out, const unsigned char *
     return start_off;
 }
 
+/* "name.ext" of a file-table entry: sanitized name plus the short extension
+   (the part after the last ':' of the type string). */
+static void file_entry_name(const ovl_file_t *finfo, char *out, size_t out_size) {
+    char name_buf[280];
+    char ext_buf[100];
+    strncpy(name_buf, finfo->name, sizeof(name_buf) - 1); name_buf[sizeof(name_buf) - 1] = '\0';
+    ovl_sanitize(name_buf);
+    /* finfo->ext is a full type string "Namespace:Class:extension" (e.g.
+       "Casino:WorldDesc:world") -- only the part after the last ':' is
+       the actual file extension (e.g. just ".world"). */
+    const char *ext_src = finfo->ext;
+    const char *last_colon = strrchr(ext_src, ':');
+    if (last_colon) ext_src = last_colon + 1;
+    strncpy(ext_buf, ext_src, sizeof(ext_buf) - 1); ext_buf[sizeof(ext_buf) - 1] = '\0';
+    if (ext_buf[0] != '\0' && ext_buf[0] != '.') {
+        char tmp[100];
+        ovl_sanitize(ext_buf);
+        _snprintf(tmp, sizeof(tmp) - 1, ".%s", ext_buf);
+        tmp[sizeof(tmp) - 1] = '\0';
+        strncpy(ext_buf, tmp, sizeof(ext_buf) - 1); ext_buf[sizeof(ext_buf) - 1] = '\0';
+    } else {
+        ovl_sanitize(ext_buf);
+    }
+    _snprintf(out, out_size - 1, "%s%s", name_buf, ext_buf);
+    out[out_size - 1] = '\0';
+}
+
 /* Builds the final entry name: known name+ext from the file table when
    has_hash and a match is found, otherwise signature-detected extension with
-   a running fallback index (mirrors unpack_ovl.py's _name_for_hash). */
+   a running fallback index (mirrors unpack_ovl.py's _name_for_hash).
+   ext_hash (0 = unknown) picks the right one among same-named files of
+   different types, see ovl_find_file_by_hash_ext. */
 static void name_for_hash(const ovl_header_t *header, int has_hash, uint32_t file_hash,
+                           uint32_t ext_hash,
                            const unsigned char *data, size_t data_size,
                            const char *fallback_prefix, int *fallback_idx,
                            char *out, size_t out_size) {
-    const ovl_file_t *finfo = has_hash ? ovl_find_file_by_hash(header, file_hash) : NULL;
+    const ovl_file_t *finfo = has_hash ? ovl_find_file_by_hash_ext(header, file_hash, ext_hash) : NULL;
     if (finfo) {
-        char name_buf[280];
-        char ext_buf[100];
-        strncpy(name_buf, finfo->name, sizeof(name_buf) - 1); name_buf[sizeof(name_buf) - 1] = '\0';
-        ovl_sanitize(name_buf);
-        /* finfo->ext is a full type string "Namespace:Class:extension" (e.g.
-           "Casino:WorldDesc:world") -- only the part after the last ':' is
-           the actual file extension (e.g. just ".world"). */
-        const char *ext_src = finfo->ext;
-        const char *last_colon = strrchr(ext_src, ':');
-        if (last_colon) ext_src = last_colon + 1;
-        strncpy(ext_buf, ext_src, sizeof(ext_buf) - 1); ext_buf[sizeof(ext_buf) - 1] = '\0';
-        if (ext_buf[0] != '\0' && ext_buf[0] != '.') {
-            char tmp[100];
-            ovl_sanitize(ext_buf);
-            _snprintf(tmp, sizeof(tmp) - 1, ".%s", ext_buf);
-            tmp[sizeof(tmp) - 1] = '\0';
-            strncpy(ext_buf, tmp, sizeof(ext_buf) - 1); ext_buf[sizeof(ext_buf) - 1] = '\0';
-        } else {
-            ovl_sanitize(ext_buf);
-        }
-        _snprintf(out, out_size - 1, "%s%s", name_buf, ext_buf);
-        out[out_size - 1] = '\0';
+        file_entry_name(finfo, out, out_size);
         return;
     }
     const char *detected = ovl_detect_ext(data, data_size);
     const char *ext = detected ? detected : ".bin";
     _snprintf(out, out_size - 1, "%s-%04d%s", fallback_prefix, (*fallback_idx)++, ext);
     out[out_size - 1] = '\0';
+}
+
+/* Lists one file's buffers as a single entry "name.ext": the n buffers in
+   bufs[] (all owned by the same DataEntry, already ordered by slot)
+   concatenated. Contiguous buffers -- always the case for v19/Elite -- are
+   referenced in place; otherwise (v20 BufferGroups) they are copied into the
+   archive's synth buffer. Empty files are skipped; if the plain name is
+   already taken (e.g. by a pool entry), ".buffers" is appended. */
+static void push_owner_buffers(ovl_wcx_handle_t *ctx, int arc_idx, const ovl_file_t *finfo,
+                               const int *bufs, int n,
+                               const uint64_t *buf_start, const uint64_t *buf_len,
+                               const unsigned char *decomp, growbuf_t *synth) {
+    uint64_t total = 0;
+    int contiguous = 1;
+    for (int j = 0; j < n; j++) {
+        total += buf_len[bufs[j]];
+        if (j > 0 && buf_start[bufs[j]] != buf_start[bufs[j - 1]] + buf_len[bufs[j - 1]]) contiguous = 0;
+    }
+    if (total == 0) return;
+
+    char full[400];
+    file_entry_name(finfo, full, sizeof(full) - 16);
+    if (entry_name_taken(ctx, full)) strcat(full, ".buffers");
+
+    if (contiguous) {
+        push_entry(ctx, full, total, arc_idx, buf_start[bufs[0]]);
+        return;
+    }
+    uint64_t off = (uint64_t)-1;
+    for (int j = 0; j < n; j++) {
+        uint64_t o = growbuf_append(synth, decomp + buf_start[bufs[j]], (size_t)buf_len[bufs[j]]);
+        if (o == (uint64_t)-1) return;
+        if (j == 0) off = o;
+    }
+    push_synth_entry(ctx, full, total, arc_idx, off);
 }
 
 /* Processes the pool and buffer data of a decompressed archive and appends
@@ -1136,6 +1192,7 @@ static void build_entries_for_archive(ovl_wcx_handle_t *ctx, int arc_idx,
     }
 
     int unknown_idx = 0;
+    growbuf_t synth = {0};  /* reconstructed content, handed to ctx->synth_bufs at the end */
 
     if (arc->num_root_entries > 0 && pools) {
         ovl_root_entry_t *root_entries = NULL; int root_count = 0;
@@ -1151,7 +1208,6 @@ static void build_entries_for_archive(ovl_wcx_handle_t *ctx, int arc_idx,
                 qsort(frags_sorted, (size_t)frag_count, sizeof(ovl_fragment_t), cmp_fragment_by_link);
             }
         }
-        growbuf_t synth = {0};
 
         int bounds_count = 0;
         pool_boundary_t *bounds = build_pool_boundaries(root_entries, root_count, fragments, frag_count, &bounds_count);
@@ -1160,13 +1216,22 @@ static void build_entries_for_archive(ovl_wcx_handle_t *ctx, int arc_idx,
         if (ovl_resolve_pool_sub_files(pools, pool_count, root_entries, root_count,
                                         fragments, frag_count, &subs, &sub_count)) {
             for (int i = 0; i < sub_count; i++) {
+                /* Same-named files of different types share the file_hash
+                   (e.g. "x.kinematic" with a DataEntry next to "x.greeble"
+                   without one) -- compare ext_hash too where both have it. */
                 int in_data_entries = 0;
                 for (int d = 0; d < data_count; d++) {
-                    if (data_entries[d].file_hash == subs[i].file_hash) { in_data_entries = 1; break; }
+                    if (data_entries[d].file_hash == subs[i].file_hash &&
+                        (data_entries[d].ext_hash == 0 || subs[i].ext_hash == 0 ||
+                         data_entries[d].ext_hash == subs[i].ext_hash)) {
+                        in_data_entries = 1;
+                        break;
+                    }
                 }
                 if (in_data_entries) continue; /* real content comes from a buffer, see below */
 
-                const ovl_file_t *sub_finfo = ovl_find_file_by_hash(&ctx->header, subs[i].file_hash);
+                const ovl_file_t *sub_finfo = ovl_find_file_by_hash_ext(&ctx->header, subs[i].file_hash,
+                                                                        subs[i].ext_hash);
 
                 if (sub_finfo && strcmp(sub_finfo->ext, "Casino:AssetPackageRes:assetpkg") == 0 && frags_sorted) {
                     /* pools[subs[i].pool_index] + subs[i].offset is exactly this
@@ -1184,8 +1249,8 @@ static void build_entries_for_archive(ovl_wcx_handle_t *ctx, int arc_idx,
                         free(resolved);
                         if (off != (uint64_t)-1) {
                             char full[400];
-                            name_for_hash(&ctx->header, 1, subs[i].file_hash, synth.data + off, out_size,
-                                          "unknown", &unknown_idx, full, sizeof(full));
+                            name_for_hash(&ctx->header, 1, subs[i].file_hash, subs[i].ext_hash,
+                                          synth.data + off, out_size, "unknown", &unknown_idx, full, sizeof(full));
                             push_synth_entry(ctx, full, out_size, arc_idx, off);
                             continue;
                         }
@@ -1201,8 +1266,8 @@ static void build_entries_for_archive(ovl_wcx_handle_t *ctx, int arc_idx,
                                                       subs[i].pool_index, (uint32_t)subs[i].offset, &out_size);
                     if (off != (uint64_t)-1) {
                         char full[400];
-                        name_for_hash(&ctx->header, 1, subs[i].file_hash, synth.data + off, out_size,
-                                      "unknown", &unknown_idx, full, sizeof(full));
+                        name_for_hash(&ctx->header, 1, subs[i].file_hash, subs[i].ext_hash,
+                                      synth.data + off, out_size, "unknown", &unknown_idx, full, sizeof(full));
                         push_synth_entry(ctx, full, out_size, arc_idx, off);
                     }
                     continue; /* on failure: skip rather than write the wrong raw stub */
@@ -1214,8 +1279,8 @@ static void build_entries_for_archive(ovl_wcx_handle_t *ctx, int arc_idx,
                                                       subs[i].pool_index, (uint32_t)subs[i].offset, &out_size);
                     if (off != (uint64_t)-1) {
                         char full[400];
-                        name_for_hash(&ctx->header, 1, subs[i].file_hash, synth.data + off, out_size,
-                                      "unknown", &unknown_idx, full, sizeof(full));
+                        name_for_hash(&ctx->header, 1, subs[i].file_hash, subs[i].ext_hash,
+                                      synth.data + off, out_size, "unknown", &unknown_idx, full, sizeof(full));
                         push_synth_entry(ctx, full, out_size, arc_idx, off);
                     }
                     continue; /* on failure: skip rather than write the wrong raw stub */
@@ -1259,8 +1324,8 @@ static void build_entries_for_archive(ovl_wcx_handle_t *ctx, int arc_idx,
                                                                (uint32_t)subs[i].offset, (uint32_t)subs[i].size,
                                                                type_buf, file_name, &out_size);
                     char full[400];
-                    name_for_hash(&ctx->header, 1, subs[i].file_hash, synth.data + off, out_size,
-                                  "unknown", &unknown_idx, full, sizeof(full));
+                    name_for_hash(&ctx->header, 1, subs[i].file_hash, subs[i].ext_hash,
+                                  synth.data + off, out_size, "unknown", &unknown_idx, full, sizeof(full));
                     push_synth_entry(ctx, full, out_size, arc_idx, off);
                     continue;
                 }
@@ -1272,13 +1337,11 @@ static void build_entries_for_archive(ovl_wcx_handle_t *ctx, int arc_idx,
                 if (sz == 0) continue;
 
                 char full[400];
-                name_for_hash(&ctx->header, 1, subs[i].file_hash, decomp + start, (size_t)sz,
-                              "unknown", &unknown_idx, full, sizeof(full));
+                name_for_hash(&ctx->header, 1, subs[i].file_hash, subs[i].ext_hash,
+                              decomp + start, (size_t)sz, "unknown", &unknown_idx, full, sizeof(full));
                 push_entry(ctx, full, sz, arc_idx, start);
             }
         }
-        ctx->synth_bufs[arc_idx] = synth.data;
-        ctx->synth_sizes[arc_idx] = synth.size;
         free(bounds);
         free(frags_sorted);
         free(subs);
@@ -1292,7 +1355,7 @@ static void build_entries_for_archive(ovl_wcx_handle_t *ctx, int arc_idx,
             py_slice_bounds(decomp_size, raw_start, pools[i].size, &start, &sz);
             if (sz == 0) continue;
             char full[400];
-            name_for_hash(&ctx->header, 1, pools[i].file_hash, decomp + start, (size_t)sz,
+            name_for_hash(&ctx->header, 1, pools[i].file_hash, 0, decomp + start, (size_t)sz,
                           "unknown", &unknown_idx, full, sizeof(full));
             push_entry(ctx, full, sz, arc_idx, start);
         }
@@ -1307,52 +1370,98 @@ static void build_entries_for_archive(ovl_wcx_handle_t *ctx, int arc_idx,
         DBG("  buf-parse: ok=%d count=%d pool_region_sz=%u pool_region_start=%u decomp_size=%zu\n",
             parse_ok, sizes_count, pool_region_sz, pool_region_start, decomp_size);
         if (parse_ok) {
-            uint32_t *buffer_hash = NULL;
-            int *buffer_hash_found = NULL;
+            int *buffer_owner = NULL;
+            int *buffer_sub = NULL;
             if (arc->num_datas > 0 && sizes_count > 0) {
-                buffer_hash = (uint32_t *)calloc((size_t)sizes_count, sizeof(uint32_t));
-                buffer_hash_found = (int *)calloc((size_t)sizes_count, sizeof(int));
+                buffer_owner = (int *)calloc((size_t)sizes_count, sizeof(int));
+                buffer_sub = (int *)calloc((size_t)sizes_count, sizeof(int));
                 ovl_buffer_group_t *groups = NULL;
                 int group_count = 0;
                 ovl_parse_buffer_groups(decomp, decomp_size, arc, version, &groups, &group_count);
-                if (buffer_hash && buffer_hash_found) {
-                    ovl_resolve_buffer_names(data_entries, data_count, groups, group_count,
-                                              sizes_count, buffer_hash, buffer_hash_found);
+                if (buffer_owner && buffer_sub) {
+                    ovl_resolve_buffer_owners(data_entries, data_count, groups, group_count,
+                                              sizes_count, buffer_owner, buffer_sub);
                 }
                 free(groups);
             }
 
+            /* Byte range of every buffer first (Python-style slice clamping). */
+            uint64_t *buf_start = (uint64_t *)calloc((size_t)sizes_count, sizeof(uint64_t));
+            uint64_t *buf_len = (uint64_t *)calloc((size_t)sizes_count, sizeof(uint64_t));
             uint64_t pos = (uint64_t)pool_region_start + pool_region_sz;
-            int buf_unknown_idx = 0;
-            for (int i = 0; i < sizes_count; i++) {
-                uint64_t raw_bsz = sizes[i];
-                uint64_t start, sz;
-                py_slice_bounds(decomp_size, pos, raw_bsz, &start, &sz);
-                DBG("    buf[%d] raw_size=%u pos=%llu -> sz=%llu\n", i, sizes[i], (unsigned long long)pos, (unsigned long long)sz);
-                if (sz > 0) {
-                    char full[160];
-                    if (buffer_hash_found && buffer_hash_found[i]) {
-                        char prefix[96];
-                        _snprintf(prefix, sizeof(prefix) - 1, "%s_unknown", arc->name);
-                        prefix[sizeof(prefix) - 1] = '\0';
-                        name_for_hash(&ctx->header, 1, buffer_hash[i], decomp + start, (size_t)sz,
-                                      prefix, &buf_unknown_idx, full, sizeof(full));
-                    } else {
-                        const char *detected = ovl_detect_ext(decomp + start, (size_t)sz);
-                        const char *ext = detected ? detected : ".bin";
-                        _snprintf(full, sizeof(full) - 1, "%s_buf%03d%s", arc->name, i, ext);
-                        full[sizeof(full) - 1] = '\0';
-                    }
-                    push_entry(ctx, full, sz, arc_idx, start);
-                }
-                pos += raw_bsz; /* unclamped advance, see comment above on slice semantics */
+            for (int i = 0; buf_start && buf_len && i < sizes_count; i++) {
+                py_slice_bounds(decomp_size, pos, sizes[i], &buf_start[i], &buf_len[i]);
+                DBG("    buf[%d] raw_size=%u pos=%llu -> sz=%llu\n", i, sizes[i], (unsigned long long)pos,
+                    (unsigned long long)buf_len[i]);
+                pos += sizes[i]; /* unclamped advance, see comment above on slice semantics */
             }
-            free(buffer_hash);
-            free(buffer_hash_found);
+
+            /* Buffers grouped by owning DataEntry, each group ordered by slot:
+               a file owning buffers is listed once, as "name.ext" with all its
+               buffers concatenated (see push_owner_buffers). */
+            int *grp_first = NULL, *grp_bufs = NULL, *grp_fill = NULL;
+            if (buffer_owner && buffer_sub && data_count > 0) {
+                grp_first = (int *)calloc((size_t)data_count + 1, sizeof(int));
+                grp_fill = (int *)calloc((size_t)data_count, sizeof(int));
+                grp_bufs = (int *)calloc((size_t)sizes_count, sizeof(int));
+            }
+            if (grp_first && grp_fill && grp_bufs) {
+                for (int i = 0; i < sizes_count; i++)
+                    if (buffer_owner[i] >= 0) grp_first[buffer_owner[i] + 1]++;
+                for (int k = 0; k < data_count; k++) grp_first[k + 1] += grp_first[k];
+                for (int i = 0; i < sizes_count; i++) {
+                    int k = buffer_owner[i];
+                    if (k < 0) continue;
+                    int *g = grp_bufs + grp_first[k];
+                    int j = grp_fill[k]++;
+                    while (j > 0 && buffer_sub[g[j - 1]] > buffer_sub[i]) { g[j] = g[j - 1]; j--; }
+                    g[j] = i;
+                }
+            }
+
+            int buf_unknown_idx = 0;
+            for (int i = 0; buf_start && buf_len && i < sizes_count; i++) {
+                int k = (grp_first && grp_fill && grp_bufs) ? buffer_owner[i] : -1;
+                const ovl_file_t *finfo = NULL;
+                if (k >= 0) {
+                    finfo = ovl_find_file_by_hash_ext(&ctx->header, data_entries[k].file_hash,
+                                                      data_entries[k].ext_hash);
+                }
+                if (finfo) {
+                    /* listed once, at the owner's first buffer in table order */
+                    if (grp_fill[k] >= 0) {
+                        push_owner_buffers(ctx, arc_idx, finfo, grp_bufs + grp_first[k],
+                                           grp_first[k + 1] - grp_first[k], buf_start, buf_len,
+                                           decomp, &synth);
+                        grp_fill[k] = -1;
+                    }
+                    continue;
+                }
+                if (buf_len[i] == 0) continue;
+                char full[400];
+                const char *detected = ovl_detect_ext(decomp + buf_start[i], (size_t)buf_len[i]);
+                const char *ext = detected ? detected : ".bin";
+                if (k >= 0) {
+                    _snprintf(full, sizeof(full) - 1, "%s_unknown-%04d%s", arc->name, buf_unknown_idx++, ext);
+                } else {
+                    _snprintf(full, sizeof(full) - 1, "%s_buf%03d%s", arc->name, i, ext);
+                }
+                full[sizeof(full) - 1] = '\0';
+                push_entry(ctx, full, buf_len[i], arc_idx, buf_start[i]);
+            }
+            free(grp_first);
+            free(grp_fill);
+            free(grp_bufs);
+            free(buf_start);
+            free(buf_len);
+            free(buffer_owner);
+            free(buffer_sub);
         }
         free(sizes);
     }
     free(data_entries);
+    ctx->synth_bufs[arc_idx] = synth.data;
+    ctx->synth_sizes[arc_idx] = synth.size;
 }
 
 /* Ensures the plugin's Oodle handle is loaded (searching upward from the

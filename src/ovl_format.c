@@ -262,6 +262,29 @@ const ovl_file_t *ovl_find_file_by_hash(const ovl_header_t *h, uint32_t file_has
     return NULL;
 }
 
+uint32_t ovl_djb2(const char *s) {
+    uint32_t hash = 5381;
+    for (; *s; s++) {
+        unsigned char c = (unsigned char)*s;
+        if (c >= 'A' && c <= 'Z') c = (unsigned char)(c - 'A' + 'a');
+        hash = (hash << 5) + hash + c;
+    }
+    return hash;
+}
+
+const ovl_file_t *ovl_find_file_by_hash_ext(const ovl_header_t *h, uint32_t file_hash,
+                                            uint32_t ext_hash) {
+    if (ext_hash != 0) {
+        for (int i = h->num_files - 1; i >= 0; i--) {
+            if (h->files[i].file_hash != file_hash) continue;
+            const char *short_ext = strrchr(h->files[i].ext, ':');
+            short_ext = short_ext ? short_ext + 1 : h->files[i].ext;
+            if (ovl_djb2(short_ext) == ext_hash) return &h->files[i];
+        }
+    }
+    return ovl_find_file_by_hash(h, file_hash);
+}
+
 /* ---- Mempool / buffer parsing ------------------------------------------------ */
 
 static void struct_sizes(int version, size_t *pg_sz, size_t *mp_sz, size_t *de_sz, size_t *be_sz) {
@@ -503,13 +526,14 @@ int ovl_parse_data_entries(const unsigned char *decomp, size_t decomp_size,
 
     for (uint32_t i = 0; i < arc->num_datas; i++) {
         size_t o = off.data_entries + (size_t)i * off.de_sz;
-        uint32_t file_hash;
+        uint32_t file_hash, ext_hash = 0;
         uint16_t buffer_count;
         uint64_t size_1, size_2;
         int ok;
         if (version >= 19) {
             uint16_t set_index;
             ok = rd_u32(decomp, decomp_size, o, &file_hash) &&
+                 rd_u32(decomp, decomp_size, o + 4, &ext_hash) &&
                  rd_u16(decomp, decomp_size, o + 8, &set_index) &&
                  rd_u16(decomp, decomp_size, o + 10, &buffer_count) &&
                  rd_u64(decomp, decomp_size, o + 16, &size_1) &&
@@ -524,6 +548,7 @@ int ovl_parse_data_entries(const unsigned char *decomp, size_t decomp_size,
         }
         if (!ok) { free(entries); return 0; }
         entries[i].file_hash = file_hash;
+        entries[i].ext_hash = ext_hash;
         entries[i].buffer_count = buffer_count;
         entries[i].size_1 = size_1;
         entries[i].size_2 = size_2;
@@ -564,6 +589,7 @@ int ovl_parse_buffer_groups(const unsigned char *decomp, size_t decomp_size,
         }
         groups[i].buffer_offset = buffer_offset;
         groups[i].buffer_count = buffer_count;
+        groups[i].buffer_index = buffer_index;
         groups[i].data_offset = data_offset;
         groups[i].data_count = data_count;
     }
@@ -636,11 +662,12 @@ int ovl_resolve_pool_sub_files(const ovl_pool_t *pools, int pool_count,
             /* Only emit entries that have an associated file_hash (from a
                RootEntry) -- Fragment-only offsets just refine boundaries. */
             int found = 0;
-            uint32_t fh = 0;
+            uint32_t fh = 0, eh = 0;
             for (int i = 0; i < root_count; i++) {
                 if (root_entries[i].pool_index == p && root_entries[i].data_offset == o) {
                     found = 1;
                     fh = root_entries[i].file_hash;
+                    eh = root_entries[i].ext_hash;
                     break;
                 }
             }
@@ -656,6 +683,7 @@ int ovl_resolve_pool_sub_files(const ovl_pool_t *pools, int pool_count,
             result[count].offset = o;
             result[count].size = next - o;
             result[count].file_hash = fh;
+            result[count].ext_hash = eh;
             result[count].has_hash = 1;
             count++;
         }
@@ -669,25 +697,38 @@ int ovl_resolve_pool_sub_files(const ovl_pool_t *pools, int pool_count,
     return 1;
 }
 
-void ovl_resolve_buffer_names(const ovl_data_entry_t *data_entries, int data_count,
+void ovl_resolve_buffer_owners(const ovl_data_entry_t *data_entries, int data_count,
                                const ovl_buffer_group_t *buffer_groups, int group_count,
-                               int num_buffers,
-                               uint32_t *buffer_hash, int *buffer_hash_found) {
-    for (int i = 0; i < num_buffers; i++) buffer_hash_found[i] = 0;
+                               int num_buffers, int *buffer_owner, int *buffer_sub) {
+    for (int i = 0; i < num_buffers; i++) { buffer_owner[i] = -1; buffer_sub[i] = 0; }
 
+    if (group_count == 0) {
+        /* No BufferGroups (JWE/Elite v19): the DataEntries claim the buffers
+           in table order. Verified on 4,957 Elite archives: the buffer_counts
+           always add up to num_buffers, and each entry's buffer sizes sum to
+           size_1 + size_2. Anything else is left unresolved. */
+        uint64_t total = 0;
+        for (int k = 0; k < data_count; k++) total += data_entries[k].buffer_count;
+        if (total != (uint64_t)num_buffers) return;
+        int buf_idx = 0;
+        for (int k = 0; k < data_count; k++) {
+            for (uint16_t n = 0; n < data_entries[k].buffer_count; n++, buf_idx++) {
+                buffer_owner[buf_idx] = k;
+                buffer_sub[buf_idx] = n;
+            }
+        }
+        return;
+    }
+
+    /* One buffer per DataEntry and group, see ovl_buffer_group_t. */
     for (int g = 0; g < group_count; g++) {
         const ovl_buffer_group_t *bg = &buffer_groups[g];
-        uint32_t buf_idx = bg->buffer_offset;
-        for (uint32_t k = bg->data_offset; k < bg->data_offset + bg->data_count; k++) {
-            if ((int)k >= data_count) break;
-            const ovl_data_entry_t *de = &data_entries[k];
-            for (uint16_t n = 0; n < de->buffer_count; n++) {
-                if ((int)buf_idx < num_buffers) {
-                    buffer_hash[buf_idx] = de->file_hash;
-                    buffer_hash_found[buf_idx] = 1;
-                }
-                buf_idx++;
-            }
+        for (uint32_t j = 0; j < bg->data_count && j < bg->buffer_count; j++) {
+            uint64_t k = (uint64_t)bg->data_offset + j;
+            uint64_t b = (uint64_t)bg->buffer_offset + j;
+            if (k >= (uint64_t)data_count || b >= (uint64_t)num_buffers) break;
+            buffer_owner[b] = (int)k;
+            buffer_sub[b] = (int)bg->buffer_index;
         }
     }
 }

@@ -90,19 +90,26 @@ typedef struct {
     uint32_t struct_offset;
 } ovl_fragment_t;
 
-/* DataEntry: identifies which/how many buffers belong to a given file_hash. */
+/* DataEntry: identifies which/how many buffers belong to a given file.
+   ext_hash (v19+, 0 before) is the djb2 of the short extension (e.g. "ms2")
+   and tells apart same-named files of different types, which share the
+   file_hash (e.g. "x.ms2" and "x.kinematic"). */
 typedef struct {
     uint32_t file_hash;
+    uint32_t ext_hash;
     uint16_t buffer_count;
     uint64_t size_1;
     uint64_t size_2;
 } ovl_data_entry_t;
 
-/* BufferGroup: maps a contiguous range of DataEntries to a contiguous range
-   of buffers (each DataEntry consumes buffer_count buffers in sequence). */
+/* BufferGroup (v20+): one buffer slot (buffer_index) for a contiguous range of
+   DataEntries -- the j-th DataEntry of the range owns buffer buffer_offset+j,
+   exactly one per group. Verified on JWE2's Init.ovl: every DataEntry's
+   buffers then sum to size_1 + size_2. */
 typedef struct {
     uint32_t buffer_offset;
     uint32_t buffer_count;
+    uint32_t buffer_index;
     uint32_t data_offset;
     uint32_t data_count;
 } ovl_buffer_group_t;
@@ -115,6 +122,7 @@ typedef struct {
     uint64_t offset;
     uint64_t size;
     uint32_t file_hash;
+    uint32_t ext_hash;   /* from the RootEntry (0 before v19), see ovl_data_entry_t */
     int has_hash;
 } ovl_sub_file_t;
 
@@ -126,6 +134,15 @@ void ovl_free_header(ovl_header_t *h);
 
 /* Looks up an ovl_file_t by file_hash (linear search, fine for typical sizes). */
 const ovl_file_t *ovl_find_file_by_hash(const ovl_header_t *h, uint32_t file_hash);
+
+/* djb2 over the lowercased string -- the engine's name/extension hash. */
+uint32_t ovl_djb2(const char *s);
+
+/* Like ovl_find_file_by_hash, but also requires djb2(short extension, i.e.
+   the part after the last ':') == ext_hash. Falls back to the hash-only
+   lookup when ext_hash is 0 or no file matches both. */
+const ovl_file_t *ovl_find_file_by_hash_ext(const ovl_header_t *h, uint32_t file_hash,
+                                            uint32_t ext_hash);
 
 int ovl_parse_mempools(const unsigned char *decomp, size_t decomp_size,
                         const ovl_archive_t *arc, int version,
@@ -169,13 +186,16 @@ int ovl_resolve_pool_sub_files(const ovl_pool_t *pools, int pool_count,
                                 const ovl_fragment_t *fragments, int fragment_count,
                                 ovl_sub_file_t **out_entries, int *out_count);
 
-/* Maps buffer index -> file_hash via DataEntry+BufferGroup. buffer_hash_found[i]
-   is 0 if buffer i has no known owner (both arrays must have num_buffers
-   entries, allocated by the caller). */
-void ovl_resolve_buffer_names(const ovl_data_entry_t *data_entries, int data_count,
+/* Maps each buffer to its owning DataEntry: buffer_owner[i] is the DataEntry
+   index (-1 = no known owner), buffer_sub[i] the buffer's slot within that
+   entry (0..buffer_count-1, empty buffers included). With BufferGroups
+   (v20+) each group assigns its buffer_index slot. Without any (JWE/Elite
+   v19: always) the DataEntries claim the buffers in table order -- only if
+   their buffer_counts add up to num_buffers, otherwise all stay -1. Both
+   arrays must have num_buffers entries, allocated by the caller. */
+void ovl_resolve_buffer_owners(const ovl_data_entry_t *data_entries, int data_count,
                                const ovl_buffer_group_t *buffer_groups, int group_count,
-                               int num_buffers,
-                               uint32_t *buffer_hash, int *buffer_hash_found);
+                               int num_buffers, int *buffer_owner, int *buffer_sub);
 
 /* Detects known file signatures (DDS, PNG, Lua, ...), returns the extension
    including the dot, or NULL if there's no match. */

@@ -30,6 +30,15 @@ enthaltenen Ressourcen entpacken — ganz ohne Python oder sonstige Laufzeitumge
 - **Pool- und Buffer-Extraktion** inkl. automatischer Dateiname-Erkennung anhand
   bekannter Signaturen (DDS, PNG, Lua, OGG, FLAC, XML, JPEG, ZIP, BMP, …) für
   Ressourcen ohne Namenszuordnung
+- **Gleichnamige Dateien verschiedenen Typs** (z. B. `x.kinematic`, `x.greeble`,
+  `x.ms2`) teilen sich den Namens-Hash; RootEntries und DataEntries werden
+  deshalb zusätzlich über ihren `ext_hash` zugeordnet, damit keine davon
+  verdeckt oder falsch benannt wird
+- **Buffer je Besitzer-Datei zusammengefügt** (Zuordnung über die DataEntries:
+  v19 wie Elite Dangerous der Reihe nach, v20 über BufferGroups). Jede Datei
+  erscheint einmal unter ihrem Namen, mit allen ihren Buffern in Slot-Reihenfolge
+  hintereinander (`anaconda_large1_doorc_.ms2` = Buffer 0 + 1 + 2, `flank.lua`);
+  nur Buffer ohne Besitzer heißen noch `STATIC_bufNNN.bin`
 - **Windows-Long-Path-Unterstützung** (`\\?\`-Präfix): auch sehr lange
   Ressourcennamen kombiniert mit tiefen Zielordnern (> 260 Zeichen) funktionieren
   zuverlässig
