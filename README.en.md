@@ -30,6 +30,11 @@ contained resources — no Python or other runtime required.
 - **Pool and buffer extraction**, including automatic filename detection via
   known signatures (DDS, PNG, Lua, OGG, FLAC, XML, JPEG, ZIP, BMP, …) for
   resources without a name mapping
+- **Structured resources** (e.g. `.assetpkg`, `.world`, `.xmlconfig`): on disk
+  their entry only points to a small object header whose pointer fields are
+  empty; the actual data is resolved via the fragment table. These three types
+  are written as XML, all other types with pointer fields as a generic, readable
+  dump (see Limitations) instead of a meaningless raw stub
 - **Same-named files of different types** (e.g. `x.ms2`, `x.mdl2` and `x.lua`)
   share the name hash; RootEntries and DataEntries are therefore also matched by
   their `ext_hash`, so none of them gets hidden or misnamed
@@ -44,11 +49,6 @@ contained resources — no Python or other runtime required.
 - **Windows long-path support** (`\\?\` prefix): reliably handles very long
   resource names combined with deep destination folders (> 260 characters)
 - Fully **read-only** (no archive creation/modification)
-
-The plugin is a straight C port of the format logic found in the accompanying
-reference script `unpack_ovl.py`, and has been cross-validated against more
-than **2,400 real `.ovl` files** — byte-identical output to the reference
-implementation.
 
 ## Installation
 
@@ -94,15 +94,9 @@ Total Commander does (via `LoadLibrary`/`GetProcAddress`) can be built with
 - The Oodle DLL is proprietary and not bundled — without it, Oodle-compressed
   archives cannot be listed/extracted (the plugin silently skips them instead
   of crashing).
-- **Known bug (unresolved format detail):** Some pools bundle several
-  independent resources back-to-back in a single memory region (observed in
-  `Config.ovl`-style XMLConfig files containing many small settings XMLs).
-  Since our parser (like the Python reference) only extracts *one* file per
-  pool, only one of the bundled resources comes out correctly named in these
-  cases; the rest are missing. So far this only affects
-  `Casino:XMLConfig:xmlconfig` files — a full scan of JWE2's entire asset tree
-  (4,750 `.ovl` files) found exactly **one** affected file. Regular assets
-  (textures, models, audio, paint jobs) are unaffected (2,400+ files tested
-  byte-identical). The exact structure that would resolve this bundling
-  (likely via the `num_fragments`/`num_root_entries` header fields) hasn't
-  been reverse-engineered yet.
+- **Structured resources without a known schema** (everything except
+  `.assetpkg`, `.world` and `.xmlconfig`) are only written as a generic
+  best-effort dump: a self-defined pseudo-XML with made-up field names
+  (`field1`, `item`, `attr1`, …), numbers as unsigned 4-byte values, at most
+  4 levels deep and 256 entries per array. It does not match a real engine
+  schema and cannot be checked against a reference.

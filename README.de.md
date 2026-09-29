@@ -30,6 +30,12 @@ enthaltenen Ressourcen entpacken — ganz ohne Python oder sonstige Laufzeitumge
 - **Pool- und Buffer-Extraktion** inkl. automatischer Dateiname-Erkennung anhand
   bekannter Signaturen (DDS, PNG, Lua, OGG, FLAC, XML, JPEG, ZIP, BMP, …) für
   Ressourcen ohne Namenszuordnung
+- **Strukturierte Ressourcen** (z. B. `.assetpkg`, `.world`, `.xmlconfig`): Der
+  Eintrag zeigt auf Disk nur auf einen kleinen Objekt-Kopf, dessen Pointer-Felder
+  leer sind; die eigentlichen Daten werden über die Fragment-Tabelle aufgelöst.
+  Diese drei Typen werden als XML ausgegeben, alle übrigen Typen mit
+  Pointer-Feldern als generischer, lesbarer Dump (siehe Einschränkungen) statt
+  als bedeutungsloser Roh-Stub
 - **Gleichnamige Dateien verschiedenen Typs** (z. B. `x.ms2`, `x.mdl2` und
   `x.lua`) teilen sich den Namens-Hash; RootEntries und DataEntries werden
   deshalb zusätzlich über ihren `ext_hash` zugeordnet, damit keine davon
@@ -46,10 +52,6 @@ enthaltenen Ressourcen entpacken — ganz ohne Python oder sonstige Laufzeitumge
   Ressourcennamen kombiniert mit tiefen Zielordnern (> 260 Zeichen) funktionieren
   zuverlässig
 - Vollständig **schreibgeschützt** (kein Erstellen/Ändern von Archiven)
-
-Das Plugin ist eine reine C-Portierung der Formatlogik aus dem mitgelieferten
-Referenzskript `unpack_ovl.py` und wurde gegen über **2.400 echte `.ovl`-Dateien**
-cross-validiert — byte-genau identische Ergebnisse zur Referenzimplementierung.
 
 ## Installation
 
@@ -95,16 +97,9 @@ selbst über `LoadLibrary`/`GetProcAddress` aufruft, lässt sich mit
 - Die Oodle-DLL ist proprietär und wird nicht mitgeliefert — ohne sie können
   Oodle-komprimierte Archive nicht gelistet/entpackt werden (das Plugin
   überspringt sie dann stillschweigend statt abzustürzen).
-- **Bekannter Bug (unbestätigtes Format-Detail):** Manche Pools bündeln mehrere
-  eigenständige Ressourcen hintereinander in einem einzigen Speicherbereich
-  (beobachtet bei `Config.ovl`-artigen XMLConfig-Dateien mit vielen kleinen
-  Einstellungs-XMLs). Da unser Parser (ebenso wie die Python-Referenz) pro Pool
-  nur *eine* Datei extrahiert, wird in diesen Fällen nur eine der gebündelten
-  Ressourcen korrekt benannt ausgegeben; die anderen fehlen. Betroffen sind
-  bislang ausschließlich `Casino:XMLConfig:xmlconfig`-Dateien — ein vollständiger
-  Scan des kompletten JWE2-Asset-Baums (4.750 `.ovl`-Dateien) fand genau
-  **eine** betroffene Datei. Reguläre Assets (Texturen, Modelle, Audio,
-  Paintjobs) sind nachweislich nicht betroffen (2.400+ getestete Dateien ohne
-  Abweichung). Die genaue Struktur, die diese Bündelung auflösen würde
-  (vermutlich über die Header-Felder `num_fragments`/`num_root_entries`), ist
-  noch nicht rekonstruiert.
+- **Strukturierte Ressourcen ohne bekanntes Schema** (alle außer `.assetpkg`,
+  `.world` und `.xmlconfig`) werden nur als generischer Best-effort-Dump
+  ausgegeben: ein selbst definiertes Pseudo-XML mit erfundenen Feldnamen
+  (`field1`, `item`, `attr1`, …), Zahlen als vorzeichenlose 4-Byte-Werte,
+  höchstens 4 Ebenen tief und 256 Einträge je Array. Es entspricht keinem
+  echten Engine-Schema und lässt sich mangels Referenz nicht gegenprüfen.
