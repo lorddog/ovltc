@@ -12,6 +12,8 @@
  * On open, the whole .ovl file is parsed and every contained archive
  * (STATIC embedded in the header, plus any external .ovs files found next
  * to the .ovl) is decompressed to build the full entry list (names + sizes).
+ * The parsed result is cached for later opens of the same, unchanged file
+ * (see "Cache of parsed archives").
  */
 #include <windows.h>
 #include <stdio.h>
@@ -59,6 +61,19 @@ typedef struct {
 
 #define ENTRY_INFO 2
 
+/* A file the parsed contents depend on besides the .ovl itself (an external
+   .ovs, or an include target described in a "Ref - " text), as it was at
+   parse time. exists = 0 records that it was looked for but not found. */
+typedef struct {
+    wchar_t *path;
+    int exists;
+    uint64_t size;
+    FILETIME mtime;
+} ovl_dep_t;
+
+/* The parsed contents of one .ovl (plus its .ovs files). Built once by
+   parse_archive and read-only afterwards, so every open handle on the same
+   file shares it -- and the cache keeps it after the last one is closed. */
 typedef struct {
     unsigned char *raw;
     size_t raw_size;
@@ -79,7 +94,6 @@ typedef struct {
     ovl_entry_t *entries;
     int entry_count;
     int entry_capacity;
-    int cur_index;
 
     wchar_t arc_path[1024];
     int dos_time;                 /* DOS date/time derived from the .ovl file's mtime */
@@ -88,9 +102,28 @@ typedef struct {
     int oodle_tried;
     int oodle_ok;
 
+    /* Cache bookkeeping (see "Cache of parsed archives"); the remaining
+       fields are guarded by g_cache_lock. */
+    uint64_t file_size;           /* the .ovl's size and last-write time when parsed */
+    FILETIME mtime;
+    ovl_dep_t *deps;
+    int dep_count, dep_capacity;
+    int cacheable;                /* 0 if a retry could give a different result
+                                     (e.g. Oodle DLL missing, unreadable .ovs) */
+    size_t mem_bytes;             /* memory held, counted against MaxMemoryMB */
+    int refcount;                 /* open handles using it */
+    int in_cache;
+    uint64_t last_used;           /* g_cache_clock at the last open */
+} ovl_wcx_data_t;
+
+/* What OpenArchiveW returns: the shared parsed archive plus this handle's
+   own position and callbacks. */
+typedef struct {
+    ovl_wcx_data_t *data;
+    int cur_index;
     tProcessDataProcW process_data_proc;
     tChangeVolProcW change_vol_proc;
-} ovl_wcx_handle_t;
+} ovl_open_t;
 
 /* ---------------------------------------------------------------------------
  * Helper functions
@@ -168,6 +201,37 @@ static int file_exists_w(const wchar_t *path) {
     return attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY);
 }
 
+/* Size and last-write time of a file. Returns 0 if it doesn't exist (or is a
+   directory). */
+static int stat_file_w(const wchar_t *path, uint64_t *size, FILETIME *mtime) {
+    wchar_t long_path[2200];
+    to_long_path(path, long_path, 2200);
+    WIN32_FILE_ATTRIBUTE_DATA fad;
+    if (!GetFileAttributesExW(long_path, GetFileExInfoStandard, &fad) ||
+        (fad.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) return 0;
+    *size = ((uint64_t)fad.nFileSizeHigh << 32) | fad.nFileSizeLow;
+    *mtime = fad.ftLastWriteTime;
+    return 1;
+}
+
+/* Records the current state of a file the parse depends on (see ovl_dep_t).
+   Out of memory just makes the parse uncacheable. */
+static void add_dep(ovl_wcx_data_t *ctx, const wchar_t *path) {
+    if (ctx->dep_count >= ctx->dep_capacity) {
+        int new_cap = ctx->dep_capacity ? ctx->dep_capacity * 2 : 8;
+        ovl_dep_t *n = (ovl_dep_t *)realloc(ctx->deps, (size_t)new_cap * sizeof(ovl_dep_t));
+        if (!n) { ctx->cacheable = 0; return; }
+        ctx->deps = n;
+        ctx->dep_capacity = new_cap;
+    }
+    ovl_dep_t *d = &ctx->deps[ctx->dep_count];
+    memset(d, 0, sizeof(*d));
+    d->path = _wcsdup(path);
+    if (!d->path) { ctx->cacheable = 0; return; }
+    d->exists = stat_file_w(path, &d->size, &d->mtime);
+    ctx->dep_count++;
+}
+
 /* Returns the directory this DLL itself lives in (no trailing backslash).
    Used as a fallback location for the Oodle DLL: dropping oo2core_*.dll
    next to the plugin lets it decompress Oodle archives even when the .ovl
@@ -187,7 +251,25 @@ static int get_plugin_dir(wchar_t *out, size_t out_count) {
     return 1;
 }
 
-static int push_entry(ovl_wcx_handle_t *ctx, const char *ascii_name,
+/* The plugin's settings file: the DLL's own path with ".ini" in place of its
+   extension (ovl_wcx.ini next to ovl_wcx.wcx64). Returns 0 on failure. */
+static int get_ini_path(wchar_t *out, size_t out_count) {
+    wchar_t path[MAX_PATH];
+    DWORD len = GetModuleFileNameW(g_hinst, path, MAX_PATH);
+    if (len == 0 || len >= MAX_PATH) return 0;
+
+    wchar_t *dot = wcsrchr(path, L'.');
+    wchar_t *slash = wcsrchr(path, L'\\');
+    if (!dot || (slash && dot < slash)) dot = path + len;
+    if ((size_t)(dot - path) + 5 > MAX_PATH) return 0;
+    wcscpy(dot, L".ini");
+
+    wcsncpy(out, path, out_count - 1);
+    out[out_count - 1] = L'\0';
+    return 1;
+}
+
+static int push_entry(ovl_wcx_data_t *ctx, const char *ascii_name,
                        uint64_t size, int archive_index, uint64_t data_offset) {
     if (ctx->entry_count >= ctx->entry_capacity) {
         int new_cap = ctx->entry_capacity ? ctx->entry_capacity * 2 : 64;
@@ -216,7 +298,7 @@ static int push_entry(ovl_wcx_handle_t *ctx, const char *ascii_name,
 
 /* Same as push_entry, but the data lives in ctx->synth_bufs[archive_index]
    (reconstructed content) instead of ctx->decomp_bufs[archive_index]. */
-static int push_synth_entry(ovl_wcx_handle_t *ctx, const char *ascii_name,
+static int push_synth_entry(ovl_wcx_data_t *ctx, const char *ascii_name,
                              uint64_t size, int archive_index, uint64_t data_offset) {
     if (!push_entry(ctx, ascii_name, size, archive_index, data_offset)) return 0;
     ctx->entries[ctx->entry_count - 1].is_synth = 1;
@@ -225,7 +307,7 @@ static int push_synth_entry(ovl_wcx_handle_t *ctx, const char *ascii_name,
 
 /* 1 if an entry with this name was already pushed (case-insensitive, like
    the file system TC extracts to). */
-static int entry_name_taken(const ovl_wcx_handle_t *ctx, const char *ascii_name) {
+static int entry_name_taken(const ovl_wcx_data_t *ctx, const char *ascii_name) {
     wchar_t w[600];
     ascii_to_wide(ascii_name, w, sizeof(w) / sizeof(w[0]));
     for (wchar_t *c = w; *c; c++) if (*c == L'/') *c = L'\\';
@@ -1185,7 +1267,7 @@ static void name_for_hash(const ovl_header_t *header, int has_hash, uint32_t fil
    referenced in place; otherwise (v20 BufferGroups) they are copied into the
    archive's synth buffer. Empty files are skipped; if the plain name is
    already taken (e.g. by a pool entry), ".buffers" is appended. */
-static void push_owner_buffers(ovl_wcx_handle_t *ctx, int arc_idx, const ovl_file_t *finfo,
+static void push_owner_buffers(ovl_wcx_data_t *ctx, int arc_idx, const ovl_file_t *finfo,
                                const int *bufs, int n,
                                const uint64_t *buf_start, const uint64_t *buf_len,
                                const unsigned char *decomp, growbuf_t *synth) {
@@ -1238,7 +1320,7 @@ static void push_owner_buffers(ovl_wcx_handle_t *ctx, int arc_idx, const ovl_fil
    engine schema) -- still far more useful than the meaningless raw stub.
    Regular buffer-backed assets (textures, models, audio, Lua modules) are
    unaffected either way. */
-static void build_entries_for_archive(ovl_wcx_handle_t *ctx, int arc_idx,
+static void build_entries_for_archive(ovl_wcx_data_t *ctx, int arc_idx,
                                        const unsigned char *decomp, size_t decomp_size) {
     const ovl_archive_t *arc = &ctx->header.archives[arc_idx];
     int version = ctx->header.version;
@@ -1534,7 +1616,7 @@ static void build_entries_for_archive(ovl_wcx_handle_t *ctx, int arc_idx,
 
 /* Ensures the plugin's Oodle handle is loaded (searching upward from the
    .ovl's directory, then next to the plugin DLL itself as a fallback). */
-static int ensure_oodle_loaded(ovl_wcx_handle_t *ctx, const wchar_t *dir_w) {
+static int ensure_oodle_loaded(ovl_wcx_data_t *ctx, const wchar_t *dir_w) {
     if (!ctx->oodle_tried) {
         ctx->oodle_tried = 1;
         /* oo2core_*.dll usually sits in the game's install root, while .ovl
@@ -1560,7 +1642,7 @@ static int ensure_oodle_loaded(ovl_wcx_handle_t *ctx, const wchar_t *dir_w) {
 /* Decompresses a compressed blob (STATIC data, or a compressed OVS batch
    file) according to the archive's compression flag. Returns a malloc'd
    buffer (caller frees) on success, NULL on failure. */
-static unsigned char *decompress_blob(ovl_wcx_handle_t *ctx, const wchar_t *dir_w,
+static unsigned char *decompress_blob(ovl_wcx_data_t *ctx, const wchar_t *dir_w,
                                        const unsigned char *compressed, uint32_t cs,
                                        uint64_t uncompressed_size, size_t *out_size) {
     *out_size = 0;
@@ -1598,7 +1680,7 @@ static unsigned char *decompress_blob(ovl_wcx_handle_t *ctx, const wchar_t *dir_
 /* Decompresses/loads a single archive (STATIC or OVS) and appends its
    entries. Errors are silently skipped -- the archive then simply
    contributes no entries instead of aborting the whole open operation. */
-static void process_archive(ovl_wcx_handle_t *ctx, int arc_idx,
+static void process_archive(ovl_wcx_data_t *ctx, int arc_idx,
                              const wchar_t *dir_w, const wchar_t *stem_w) {
     const ovl_archive_t *arc = &ctx->header.archives[arc_idx];
     unsigned char *decomp = NULL;
@@ -1626,7 +1708,7 @@ static void process_archive(ovl_wcx_handle_t *ctx, int arc_idx,
             owns = 0;
         } else {
             decomp = decompress_blob(ctx, dir_w, compressed, cs, arc->uncompressed_size, &decomp_size);
-            if (!decomp) return;
+            if (!decomp) { ctx->cacheable = 0; return; } /* may work next time, e.g. with the Oodle DLL */
             owns = 1;
         }
     } else {
@@ -1645,6 +1727,9 @@ static void process_archive(ovl_wcx_handle_t *ctx, int arc_idx,
         const wchar_t *chosen = NULL;
         if (file_exists_w(cand1)) chosen = cand1;
         else if (file_exists_w(cand2)) chosen = cand2;
+        /* The result depends on which candidate exists and on its contents. */
+        add_dep(ctx, cand1);
+        if (chosen != cand1) add_dep(ctx, cand2);
         if (!chosen) {
             DBG("  -> OVS not found, checked: %ls | %ls\n", cand1, cand2);
             return;
@@ -1653,7 +1738,7 @@ static void process_archive(ovl_wcx_handle_t *ctx, int arc_idx,
         DBG("  -> OVS found: %ls\n", chosen);
         unsigned char *raw_ovs = NULL;
         size_t raw_ovs_size = 0;
-        if (!read_whole_file_w(chosen, &raw_ovs, &raw_ovs_size)) { DBG("  -> failed to read OVS\n"); return; }
+        if (!read_whole_file_w(chosen, &raw_ovs, &raw_ovs_size)) { DBG("  -> failed to read OVS\n"); ctx->cacheable = 0; return; }
 
         /* OVS batch files are usually stored uncompressed, but some are
            still compressed (raw size matches compressed_size instead of
@@ -1662,7 +1747,7 @@ static void process_archive(ovl_wcx_handle_t *ctx, int arc_idx,
             arc->uncompressed_size != raw_ovs_size && ctx->header.compression != OVL_COMPRESSION_NONE) {
             decomp = decompress_blob(ctx, dir_w, raw_ovs, (uint32_t)raw_ovs_size, arc->uncompressed_size, &decomp_size);
             free(raw_ovs);
-            if (!decomp) { DBG("  -> OVS was compressed but decompression failed\n"); return; }
+            if (!decomp) { DBG("  -> OVS was compressed but decompression failed\n"); ctx->cacheable = 0; return; }
             DBG("  -> OVS was compressed, decompressed to %zu bytes\n", decomp_size);
             owns = 1;
         } else {
@@ -1707,7 +1792,7 @@ static void ensure_directories_w(const wchar_t *path) {
    includes others looks empty. The text (UTF-8) names the target, its
    resolved path next to the .ovl and whether it exists; it lives in
    ctx->info_buf. */
-static void push_include_refs(ovl_wcx_handle_t *ctx, const wchar_t *dir_w) {
+static void push_include_refs(ovl_wcx_data_t *ctx, const wchar_t *dir_w) {
     growbuf_t gb = {0};
     const wchar_t *arc_file = wcsrchr(ctx->arc_path, L'\\');
     arc_file = arc_file ? arc_file + 1 : ctx->arc_path;
@@ -1723,19 +1808,17 @@ static void push_include_refs(ovl_wcx_handle_t *ctx, const wchar_t *dir_w) {
         _snwprintf(target, 1399, L"%s%hs.ovl", dir_w, inc);
         target[1399] = L'\0';
         for (wchar_t *c = target; *c; c++) if (*c == L'/') *c = L'\\';
-        wchar_t target_long[1500];
-        to_long_path(target, target_long, 1500);
-        WIN32_FILE_ATTRIBUTE_DATA fad;
-        int exists = GetFileAttributesExW(target_long, GetFileExInfoStandard, &fad) &&
-                     !(fad.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY);
+        uint64_t target_size = 0;
+        FILETIME target_mtime;
+        int exists = stat_file_w(target, &target_size, &target_mtime);
+        add_dep(ctx, target); /* the text names its status and size */
 
         char target_u8[4096];
         if (!WideCharToMultiByte(CP_UTF8, 0, target, -1, target_u8, sizeof(target_u8), NULL, NULL))
             strcpy(target_u8, "?");
         char status[64];
         if (exists) {
-            _snprintf(status, sizeof(status) - 1, "vorhanden, %llu Byte",
-                      ((unsigned long long)fad.nFileSizeHigh << 32) | fad.nFileSizeLow);
+            _snprintf(status, sizeof(status) - 1, "vorhanden, %llu Byte", (unsigned long long)target_size);
         } else {
             strcpy(status, "nicht gefunden");
         }
@@ -1775,17 +1858,52 @@ static void push_include_refs(ovl_wcx_handle_t *ctx, const wchar_t *dir_w) {
     ctx->info_size = gb.size;
 }
 
-/* ---------------------------------------------------------------------------
- * WCX interface
- * ------------------------------------------------------------------------- */
+static void free_archive_data(ovl_wcx_data_t *ctx) {
+    if (ctx->decomp_bufs) {
+        for (int i = 0; i < ctx->header.num_archives; i++) {
+            if (ctx->owns_buf && ctx->owns_buf[i] && ctx->decomp_bufs[i]) free(ctx->decomp_bufs[i]);
+        }
+    }
+    if (ctx->synth_bufs) {
+        for (int i = 0; i < ctx->header.num_archives; i++) {
+            free(ctx->synth_bufs[i]);
+        }
+    }
+    free(ctx->decomp_bufs);
+    free(ctx->decomp_sizes);
+    free(ctx->owns_buf);
+    free(ctx->synth_bufs);
+    free(ctx->synth_sizes);
+    free(ctx->info_buf);
+    free(ctx->entries);
+    for (int i = 0; i < ctx->dep_count; i++) free(ctx->deps[i].path);
+    free(ctx->deps);
+    ovl_free_header(&ctx->header);
+    free(ctx->raw);
+    if (ctx->oodle_ok) ovl_oodle_unload(&ctx->oodle);
+    free(ctx);
+}
 
-HANDLE __stdcall OpenArchiveW(tOpenArchiveDataW *ArchiveData) {
-    ArchiveData->OpenResult = 0;
+/* Memory held by a parsed archive (what counts against MaxMemoryMB; small
+   bookkeeping arrays left out). */
+static size_t archive_mem_bytes(const ovl_wcx_data_t *ctx) {
+    size_t n = sizeof(*ctx) + ctx->raw_size + ctx->info_size +
+               (size_t)ctx->entry_capacity * sizeof(ovl_entry_t) +
+               (size_t)ctx->header.num_files * sizeof(ovl_file_t);
+    for (int i = 0; i < ctx->header.num_archives; i++) {
+        if (ctx->owns_buf[i]) n += ctx->decomp_sizes[i];
+        n += ctx->synth_sizes[i];
+    }
+    return n;
+}
 
+/* Reads and parses the .ovl at arc_name. Returns NULL with *open_result set
+   (E_*) on failure. */
+static ovl_wcx_data_t *parse_archive(const wchar_t *arc_name, int *open_result) {
     unsigned char *raw = NULL;
     size_t raw_size = 0;
-    if (!read_whole_file_w(ArchiveData->ArcName, &raw, &raw_size)) {
-        ArchiveData->OpenResult = E_EOPEN;
+    if (!read_whole_file_w(arc_name, &raw, &raw_size)) {
+        *open_result = E_EOPEN;
         return NULL;
     }
 
@@ -1794,25 +1912,26 @@ HANDLE __stdcall OpenArchiveW(tOpenArchiveDataW *ArchiveData) {
     if (!ovl_parse_header(raw, raw_size, &header, errbuf, sizeof(errbuf))) {
         DBG("ovl_parse_header failed: %s\n", errbuf);
         free(raw);
-        ArchiveData->OpenResult = E_UNKNOWN_FORMAT;
+        *open_result = E_UNKNOWN_FORMAT;
         return NULL;
     }
     DBG("Header OK: version=%d compression=%d files=%d archives=%d data_start=%u raw_size=%zu\n",
         header.version, header.compression, header.num_files, header.num_archives,
         header.data_start, raw_size);
 
-    ovl_wcx_handle_t *ctx = (ovl_wcx_handle_t *)calloc(1, sizeof(ovl_wcx_handle_t));
+    ovl_wcx_data_t *ctx = (ovl_wcx_data_t *)calloc(1, sizeof(ovl_wcx_data_t));
     if (!ctx) {
         ovl_free_header(&header);
         free(raw);
-        ArchiveData->OpenResult = E_NO_MEMORY;
+        *open_result = E_NO_MEMORY;
         return NULL;
     }
 
     ctx->raw = raw;
     ctx->raw_size = raw_size;
     ctx->header = header;
-    wcsncpy(ctx->arc_path, ArchiveData->ArcName, 1023);
+    ctx->cacheable = 1;
+    wcsncpy(ctx->arc_path, arc_name, 1023);
     ctx->arc_path[1023] = L'\0';
 
     ctx->decomp_bufs = (unsigned char **)calloc(header.num_archives ? header.num_archives : 1, sizeof(unsigned char *));
@@ -1826,14 +1945,14 @@ HANDLE __stdcall OpenArchiveW(tOpenArchiveDataW *ArchiveData) {
         ovl_free_header(&ctx->header);
         free(ctx->raw);
         free(ctx);
-        ArchiveData->OpenResult = E_NO_MEMORY;
+        *open_result = E_NO_MEMORY;
         return NULL;
     }
 
     /* Use the .ovl file's own mtime for all entries (the format itself
        carries no per-file timestamps). */
     wchar_t ovl_long_path[2200];
-    to_long_path(ArchiveData->ArcName, ovl_long_path, 2200);
+    to_long_path(arc_name, ovl_long_path, 2200);
     HANDLE fh = CreateFileW(ovl_long_path, GENERIC_READ, FILE_SHARE_READ, NULL,
                              OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     FILETIME ft_local = {0};
@@ -1849,7 +1968,7 @@ HANDLE __stdcall OpenArchiveW(tOpenArchiveDataW *ArchiveData) {
     ctx->dos_time = ((int)fatdate << 16) | fattime;
 
     wchar_t drive[8] = {0}, dir_part[1024] = {0}, fname[512] = {0}, ext_part[64] = {0};
-    _wsplitpath_s(ArchiveData->ArcName, drive, 8, dir_part, 1024, fname, 512, ext_part, 64);
+    _wsplitpath_s(arc_name, drive, 8, dir_part, 1024, fname, 512, ext_part, 64);
     wchar_t dir_w[1024];
     _snwprintf(dir_w, 1023, L"%s%s", drive, dir_part); dir_w[1023] = 0;
     wchar_t stem_w[512];
@@ -1861,7 +1980,213 @@ HANDLE __stdcall OpenArchiveW(tOpenArchiveDataW *ArchiveData) {
         process_archive(ctx, i, dir_w, stem_w);
     }
 
-    return (HANDLE)ctx;
+    /* Parsing is done. Drop what only parsing needed, so it doesn't stay
+       around for as long as the archive is cached: the Oodle DLL, the raw
+       .ovl bytes (unless an uncompressed STATIC archive points into them)
+       and the spare room in the entry list. */
+    if (ctx->oodle_ok) {
+        ovl_oodle_unload(&ctx->oodle);
+        ctx->oodle_ok = 0;
+    }
+    int raw_in_use = 0;
+    for (int i = 0; i < header.num_archives; i++) {
+        if (ctx->decomp_bufs[i] && !ctx->owns_buf[i]) raw_in_use = 1;
+    }
+    if (!raw_in_use) {
+        free(ctx->raw);
+        ctx->raw = NULL;
+        ctx->raw_size = 0;
+    }
+    if (ctx->entry_count > 0 && ctx->entry_count < ctx->entry_capacity) {
+        ovl_entry_t *n = (ovl_entry_t *)realloc(ctx->entries, (size_t)ctx->entry_count * sizeof(ovl_entry_t));
+        if (n) {
+            ctx->entries = n;
+            ctx->entry_capacity = ctx->entry_count;
+        }
+    }
+    ctx->mem_bytes = archive_mem_bytes(ctx);
+    return ctx;
+}
+
+/* ---------------------------------------------------------------------------
+ * Cache of parsed archives
+ *
+ * TC opens an archive anew for every operation: once to list it, and again
+ * for every F3/view or copy out of it. Parsing a large .ovl can take a
+ * while, so a parsed archive stays in memory after CloseArchive and the next
+ * OpenArchiveW on the same file reuses it -- as long as the file is
+ * unchanged (same size and last-write time, likewise its .ovs files and
+ * include targets). The settings are read on every open, so a change
+ * applies without restarting TC; they live in section [Cache] of
+ * ovl_wcx.ini next to the plugin (see get_ini_path):
+ *
+ *   Enabled=1        0 = parse on every open, keep nothing
+ *   MaxMemoryMB=512  memory the cached archives may use; the least recently
+ *                    used ones are dropped first
+ *
+ * For scale: a big .ovl takes several times its file size once parsed
+ * (decompressed data plus reconstructed structured resources), e.g. about
+ * 220 MB for a 26 MB file.
+ * ------------------------------------------------------------------------- */
+
+#define CACHE_DEFAULT_MAX_MB 512
+
+static CRITICAL_SECTION g_cache_lock;
+static ovl_wcx_data_t **g_cache;     /* cached archives, unordered */
+static int g_cache_count, g_cache_capacity;
+static uint64_t g_cache_clock;       /* advanced on every use, for LRU */
+static uint64_t g_cache_max_bytes;   /* 0 = cache disabled */
+
+/* Cache size limit in bytes from the settings (0 if disabled). */
+static uint64_t cache_read_settings(void) {
+    wchar_t ini[MAX_PATH];
+    if (!get_ini_path(ini, MAX_PATH)) return (uint64_t)CACHE_DEFAULT_MAX_MB << 20;
+    if (!GetPrivateProfileIntW(L"Cache", L"Enabled", 1, ini)) return 0;
+    return (uint64_t)GetPrivateProfileIntW(L"Cache", L"MaxMemoryMB", CACHE_DEFAULT_MAX_MB, ini) << 20;
+}
+
+/* Takes cached archive i out of the cache; frees it unless a handle still
+   uses it (then the last CloseArchive does). Caller holds g_cache_lock. */
+static void cache_remove_locked(int i) {
+    ovl_wcx_data_t *d = g_cache[i];
+    g_cache[i] = g_cache[--g_cache_count];
+    d->in_cache = 0;
+    if (d->refcount == 0) free_archive_data(d);
+}
+
+/* Drops the least recently used archives no handle uses until the cache
+   fits into g_cache_max_bytes. Caller holds g_cache_lock. */
+static void cache_trim_locked(void) {
+    for (;;) {
+        uint64_t total = 0;
+        int victim = -1;
+        for (int i = 0; i < g_cache_count; i++) {
+            total += g_cache[i]->mem_bytes;
+            if (g_cache[i]->refcount == 0 &&
+                (victim < 0 || g_cache[i]->last_used < g_cache[victim]->last_used)) victim = i;
+        }
+        if (total <= g_cache_max_bytes || victim < 0) return;
+        DBG("cache: dropping %ls\n", g_cache[victim]->arc_path);
+        cache_remove_locked(victim);
+    }
+}
+
+static void cache_set_limit(uint64_t max_bytes) {
+    EnterCriticalSection(&g_cache_lock);
+    g_cache_max_bytes = max_bytes;
+    cache_trim_locked();
+    LeaveCriticalSection(&g_cache_lock);
+}
+
+/* 1 if the files a cached archive was parsed from are unchanged. */
+static int cache_entry_valid(const ovl_wcx_data_t *d, uint64_t size, const FILETIME *mtime) {
+    if (d->file_size != size || CompareFileTime(&d->mtime, mtime) != 0) return 0;
+    for (int i = 0; i < d->dep_count; i++) {
+        uint64_t dep_size = 0;
+        FILETIME dep_mtime;
+        int exists = stat_file_w(d->deps[i].path, &dep_size, &dep_mtime);
+        if (exists != d->deps[i].exists) return 0;
+        if (exists && (dep_size != d->deps[i].size || CompareFileTime(&dep_mtime, &d->deps[i].mtime) != 0)) return 0;
+    }
+    return 1;
+}
+
+/* The cached archive for path (size and mtime: the .ovl's current state)
+   with one more reference, or NULL if there is none or the file has changed
+   since (that one is dropped). */
+static ovl_wcx_data_t *cache_acquire(const wchar_t *path, uint64_t size, const FILETIME *mtime) {
+    ovl_wcx_data_t *found = NULL;
+    EnterCriticalSection(&g_cache_lock);
+    for (int i = 0; i < g_cache_count; i++) {
+        if (_wcsicmp(g_cache[i]->arc_path, path) != 0) continue;
+        if (cache_entry_valid(g_cache[i], size, mtime)) {
+            found = g_cache[i];
+            found->refcount++;
+            found->last_used = ++g_cache_clock;
+        } else {
+            DBG("cache: %ls has changed, parsing it again\n", path);
+            cache_remove_locked(i);
+        }
+        break;
+    }
+    LeaveCriticalSection(&g_cache_lock);
+    return found;
+}
+
+/* Adds a freshly parsed archive (refcount 1, held by the caller) to the
+   cache, if it may be cached and fits. */
+static void cache_insert(ovl_wcx_data_t *d) {
+    EnterCriticalSection(&g_cache_lock);
+    int cached_already = 0; /* by a concurrent open of the same file */
+    for (int i = 0; i < g_cache_count; i++) {
+        if (_wcsicmp(g_cache[i]->arc_path, d->arc_path) == 0) cached_already = 1;
+    }
+    if (d->cacheable && !cached_already && d->mem_bytes <= g_cache_max_bytes) {
+        if (g_cache_count >= g_cache_capacity) {
+            int new_cap = g_cache_capacity ? g_cache_capacity * 2 : 16;
+            ovl_wcx_data_t **n = (ovl_wcx_data_t **)realloc(g_cache, (size_t)new_cap * sizeof(*n));
+            if (n) {
+                g_cache = n;
+                g_cache_capacity = new_cap;
+            }
+        }
+        if (g_cache_count < g_cache_capacity) {
+            d->in_cache = 1;
+            d->last_used = ++g_cache_clock;
+            g_cache[g_cache_count++] = d;
+            DBG("cache: keeping %ls (%.1f MB)\n", d->arc_path, d->mem_bytes / 1048576.0);
+            cache_trim_locked();
+        }
+    }
+    LeaveCriticalSection(&g_cache_lock);
+}
+
+/* Drops one handle's reference; frees the archive if it was the last one
+   and the archive isn't cached. */
+static void cache_release(ovl_wcx_data_t *d) {
+    EnterCriticalSection(&g_cache_lock);
+    d->refcount--;
+    if (d->refcount == 0 && !d->in_cache) free_archive_data(d);
+    else cache_trim_locked(); /* while in use, it may have kept the cache over its limit */
+    LeaveCriticalSection(&g_cache_lock);
+}
+
+/* ---------------------------------------------------------------------------
+ * WCX interface
+ * ------------------------------------------------------------------------- */
+
+HANDLE __stdcall OpenArchiveW(tOpenArchiveDataW *ArchiveData) {
+    ArchiveData->OpenResult = 0;
+
+    ovl_open_t *h = (ovl_open_t *)calloc(1, sizeof(ovl_open_t));
+    if (!h) {
+        ArchiveData->OpenResult = E_NO_MEMORY;
+        return NULL;
+    }
+
+    cache_set_limit(cache_read_settings());
+    uint64_t size = 0;
+    FILETIME mtime = {0};
+    int have_stat = stat_file_w(ArchiveData->ArcName, &size, &mtime);
+    if (have_stat) h->data = cache_acquire(ArchiveData->ArcName, size, &mtime);
+    if (h->data) {
+        DBG("cache: reusing %ls\n", ArchiveData->ArcName);
+        return (HANDLE)h;
+    }
+
+    h->data = parse_archive(ArchiveData->ArcName, &ArchiveData->OpenResult);
+    if (!h->data) {
+        free(h);
+        return NULL;
+    }
+    /* Size and mtime from before reading the file: if it changes while it
+       is being parsed, the next open sees the difference and parses again. */
+    h->data->file_size = size;
+    h->data->mtime = mtime;
+    if (!have_stat) h->data->cacheable = 0;
+    h->data->refcount = 1;
+    cache_insert(h->data);
+    return (HANDLE)h;
 }
 
 /* ---------------------------------------------------------------------------
@@ -1905,10 +2230,11 @@ int __stdcall PackFiles(char *PackedFile, char *SubPath, char *SrcPath, char *Ad
 }
 
 int __stdcall ReadHeaderExW(HANDLE hArcData, tHeaderDataExW *HeaderDataEx) {
-    ovl_wcx_handle_t *ctx = (ovl_wcx_handle_t *)hArcData;
-    if (ctx->cur_index >= ctx->entry_count) return E_END_ARCHIVE;
+    ovl_open_t *h = (ovl_open_t *)hArcData;
+    const ovl_wcx_data_t *ctx = h->data;
+    if (h->cur_index >= ctx->entry_count) return E_END_ARCHIVE;
 
-    ovl_entry_t *e = &ctx->entries[ctx->cur_index];
+    const ovl_entry_t *e = &ctx->entries[h->cur_index];
     memset(HeaderDataEx, 0, sizeof(*HeaderDataEx));
 
     wcsncpy(HeaderDataEx->FileName, e->name, 1023);
@@ -1921,15 +2247,16 @@ int __stdcall ReadHeaderExW(HANDLE hArcData, tHeaderDataExW *HeaderDataEx) {
     HeaderDataEx->FileAttr = FILE_ATTRIBUTE_ARCHIVE;
     HeaderDataEx->HostOS = 0;
 
-    ctx->cur_index++;
+    h->cur_index++;
     return 0;
 }
 
 int __stdcall ProcessFileW(HANDLE hArcData, int Operation, wchar_t *DestPath, wchar_t *DestName) {
-    ovl_wcx_handle_t *ctx = (ovl_wcx_handle_t *)hArcData;
-    if (ctx->cur_index <= 0 || ctx->cur_index > ctx->entry_count) return E_BAD_ARCHIVE;
+    ovl_open_t *h = (ovl_open_t *)hArcData;
+    const ovl_wcx_data_t *ctx = h->data;
+    if (h->cur_index <= 0 || h->cur_index > ctx->entry_count) return E_BAD_ARCHIVE;
 
-    ovl_entry_t *e = &ctx->entries[ctx->cur_index - 1];
+    const ovl_entry_t *e = &ctx->entries[h->cur_index - 1];
 
     if (Operation == PK_SKIP || Operation == PK_TEST) {
         return 0;
@@ -1984,8 +2311,8 @@ int __stdcall ProcessFileW(HANDLE hArcData, int Operation, wchar_t *DestPath, wc
         src += to_write;
         remaining -= to_write;
 
-        if (ctx->process_data_proc) {
-            if (ctx->process_data_proc(DestName, (int)to_write) == 0) {
+        if (h->process_data_proc) {
+            if (h->process_data_proc(DestName, (int)to_write) == 0) {
                 aborted = 1;
                 break;
             }
@@ -2015,41 +2342,22 @@ int __stdcall ProcessFileW(HANDLE hArcData, int Operation, wchar_t *DestPath, wc
 }
 
 int __stdcall CloseArchive(HANDLE hArcData) {
-    ovl_wcx_handle_t *ctx = (ovl_wcx_handle_t *)hArcData;
-    if (!ctx) return 0;
+    ovl_open_t *h = (ovl_open_t *)hArcData;
+    if (!h) return 0;
 
-    if (ctx->decomp_bufs) {
-        for (int i = 0; i < ctx->header.num_archives; i++) {
-            if (ctx->owns_buf && ctx->owns_buf[i] && ctx->decomp_bufs[i]) free(ctx->decomp_bufs[i]);
-        }
-    }
-    if (ctx->synth_bufs) {
-        for (int i = 0; i < ctx->header.num_archives; i++) {
-            free(ctx->synth_bufs[i]);
-        }
-    }
-    free(ctx->decomp_bufs);
-    free(ctx->decomp_sizes);
-    free(ctx->owns_buf);
-    free(ctx->synth_bufs);
-    free(ctx->synth_sizes);
-    free(ctx->info_buf);
-    free(ctx->entries);
-    ovl_free_header(&ctx->header);
-    free(ctx->raw);
-    if (ctx->oodle_ok) ovl_oodle_unload(&ctx->oodle);
-    free(ctx);
+    cache_release(h->data);
+    free(h);
     return 0;
 }
 
 void __stdcall SetChangeVolProcW(HANDLE hArcData, tChangeVolProcW pChangeVolProc1) {
-    ovl_wcx_handle_t *ctx = (ovl_wcx_handle_t *)hArcData;
-    ctx->change_vol_proc = pChangeVolProc1;
+    ovl_open_t *h = (ovl_open_t *)hArcData;
+    h->change_vol_proc = pChangeVolProc1;
 }
 
 void __stdcall SetProcessDataProcW(HANDLE hArcData, tProcessDataProcW pProcessDataProc) {
-    ovl_wcx_handle_t *ctx = (ovl_wcx_handle_t *)hArcData;
-    ctx->process_data_proc = pProcessDataProc;
+    ovl_open_t *h = (ovl_open_t *)hArcData;
+    h->process_data_proc = pProcessDataProc;
 }
 
 int __stdcall GetPackerCaps(void) {
@@ -2057,10 +2365,17 @@ int __stdcall GetPackerCaps(void) {
 }
 
 BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved) {
-    (void)reserved;
     if (reason == DLL_PROCESS_ATTACH) {
         g_hinst = hinst;
         DisableThreadLibraryCalls(hinst);
+        InitializeCriticalSection(&g_cache_lock);
+    } else if (reason == DLL_PROCESS_DETACH && reserved == NULL) {
+        /* Unloaded by FreeLibrary rather than at process exit (TC itself
+           keeps the plugin loaded): give the cached archives' memory back. */
+        g_cache_max_bytes = 0;
+        cache_trim_locked();
+        free(g_cache);
+        DeleteCriticalSection(&g_cache_lock);
     }
     return TRUE;
 }

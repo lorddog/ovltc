@@ -46,6 +46,11 @@ contained resources — no Python or other runtime required.
   own name, with all its buffers concatenated in slot order (`model.ms2` =
   buffer 0 + 1 + 2, `script.lua`); only buffers without an owner are still
   called `STATIC_bufNNN.bin`
+- **Cache**: an archive stays in memory once it has been read. Total Commander
+  opens the archive anew for every action (listing, every F3, every copy);
+  from the second time on its contents show up instantly, without
+  decompressing again. If the `.ovl` file or one of its `.ovs` files changes,
+  it is read again. Configurable, see [Settings](#settings)
 - **Windows long-path support** (`\\?\` prefix): reliably handles very long
   resource names combined with deep destination folders (> 260 characters)
 - Fully **read-only** (no archive creation/modification)
@@ -63,6 +68,27 @@ contained resources — no Python or other runtime required.
   ```
   ovl=0,C:\path\to\Plugins\wcx\OVL\ovl_wcx.wcx64
   ```
+
+## Settings
+
+Optional, in a file `ovl_wcx.ini` next to `ovl_wcx.wcx64` (create it if
+needed). Changes apply the next time an archive is opened, without
+restarting Total Commander.
+
+```ini
+[Cache]
+Enabled=1
+MaxMemoryMB=512
+```
+
+| Key | Default | Meaning |
+|---|---|---|
+| `Enabled` | `1` | `0` turns the cache off: every open reads the file again |
+| `MaxMemoryMB` | `512` | Memory for cached archives; when it runs short, the least recently used ones are dropped |
+
+Once read, a large archive takes several times its file size (e.g. about
+220 MB for a 26 MB `.ovl`). The memory stays in the Total Commander process
+until the limit is reached or Total Commander exits.
 
 ## Building
 

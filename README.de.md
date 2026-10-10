@@ -48,6 +48,11 @@ enthaltenen Ressourcen entpacken — ganz ohne Python oder sonstige Laufzeitumge
   ihrem Namen, mit allen ihren Buffern in Slot-Reihenfolge hintereinander
   (`model.ms2` = Buffer 0 + 1 + 2, `script.lua`); nur Buffer ohne Besitzer
   heißen noch `STATIC_bufNNN.bin`
+- **Cache**: Ein einmal eingelesenes Archiv bleibt im Speicher. Total Commander
+  öffnet das Archiv für jede Aktion neu (Auflisten, jedes F3, jedes Kopieren);
+  ab dem zweiten Mal kommt der Inhalt dann sofort, ohne erneutes Entpacken.
+  Ändert sich die `.ovl`-Datei oder eine ihrer `.ovs`-Dateien, wird sie neu
+  eingelesen. Einstellbar, siehe [Einstellungen](#einstellungen)
 - **Windows-Long-Path-Unterstützung** (`\\?\`-Präfix): auch sehr lange
   Ressourcennamen kombiniert mit tiefen Zielordnern (> 260 Zeichen) funktionieren
   zuverlässig
@@ -66,6 +71,28 @@ enthaltenen Ressourcen entpacken — ganz ohne Python oder sonstige Laufzeitumge
   ```
   ovl=0,C:\Pfad\zu\Plugins\wcx\OVL\ovl_wcx.wcx64
   ```
+
+## Einstellungen
+
+Optional in der Datei `ovl_wcx.ini` neben `ovl_wcx.wcx64` (bei Bedarf selbst
+anlegen). Änderungen gelten ab dem nächsten Öffnen eines Archivs, ohne
+Neustart von Total Commander.
+
+```ini
+[Cache]
+Enabled=1
+MaxMemoryMB=512
+```
+
+| Schlüssel | Standard | Bedeutung |
+|---|---|---|
+| `Enabled` | `1` | `0` schaltet den Cache aus: Jedes Öffnen liest die Datei neu ein |
+| `MaxMemoryMB` | `512` | Speicher für zwischengespeicherte Archive; wird er knapp, fallen die am längsten nicht benutzten heraus |
+
+Ein großes Archiv belegt eingelesen ein Mehrfaches seiner Dateigröße (z. B.
+rund 220 MB für eine 26 MB große `.ovl`). Der Speicher bleibt im
+Total-Commander-Prozess, bis die Grenze erreicht ist oder Total Commander
+beendet wird.
 
 ## Build
 
