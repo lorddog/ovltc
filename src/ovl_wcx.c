@@ -301,6 +301,18 @@ static const ovl_fragment_t *find_link(const ovl_fragment_t *sorted, int count,
     return NULL;
 }
 
+/* First fragment in sorted whose link is >= (pool_index, offset); count if none. */
+static int link_lower_bound(const ovl_fragment_t *sorted, int count, int32_t pool_index, uint32_t offset) {
+    int lo = 0, hi = count;
+    while (lo < hi) {
+        int mid = lo + (hi - lo) / 2;
+        const ovl_fragment_t *f = &sorted[mid];
+        if (f->link_pool < pool_index || (f->link_pool == pool_index && f->link_offset < offset)) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo;
+}
+
 /* Reconstructs a Casino:AssetPackageRes:assetpkg file's real XML content.
    See unpack_ovl.py's _resolve_assetpkg for the full explanation: on disk,
    an AssetpkgRoot MemStruct is just an 8-byte Pointer (to a NUL-terminated
@@ -400,6 +412,15 @@ static uint64_t growbuf_append(growbuf_t *gb, const unsigned char *bytes, size_t
     uint64_t off = gb->size;
     gb->size += n;
     return off;
+}
+
+/* Appends v in decimal, the same digits as printf's "%u" (without the
+   printf overhead -- the generic dump writes millions of numbers). */
+static void growbuf_append_u32(growbuf_t *gb, uint32_t v) {
+    char buf[10];
+    int n = 0;
+    do { buf[sizeof(buf) - 1 - n++] = (char)('0' + v % 10); v /= 10; } while (v);
+    growbuf_append(gb, (const unsigned char *)buf + sizeof(buf) - n, (size_t)n);
 }
 
 /* Appends "\t\t<pointer>{name}</pointer>\n" for each resolved ZStringList
@@ -647,15 +668,22 @@ static xml_node_t *xml_parse_element(const char **p) {
 static void xml_append_str(growbuf_t *out, const char *s) { growbuf_append(out, (const unsigned char *)s, strlen(s)); }
 
 static void xml_append_escaped(growbuf_t *out, const char *s, int is_attr) {
+    const char *run = s; /* start of the pending run of characters that need no escaping */
     for (; *s; s++) {
+        const char *esc;
         switch (*s) {
-            case '&': xml_append_str(out, "&amp;"); break;
-            case '<': xml_append_str(out, "&lt;"); break;
-            case '>': xml_append_str(out, "&gt;"); break;
-            case '"': if (is_attr) xml_append_str(out, "&quot;"); else growbuf_append(out, (const unsigned char *)s, 1); break;
-            default: growbuf_append(out, (const unsigned char *)s, 1);
+            case '&': esc = "&amp;"; break;
+            case '<': esc = "&lt;"; break;
+            case '>': esc = "&gt;"; break;
+            case '"': esc = is_attr ? "&quot;" : NULL; break;
+            default: esc = NULL;
         }
+        if (!esc) continue;
+        if (s > run) growbuf_append(out, (const unsigned char *)run, (size_t)(s - run));
+        xml_append_str(out, esc);
+        run = s + 1;
     }
+    if (s > run) growbuf_append(out, (const unsigned char *)run, (size_t)(s - run));
 }
 
 static void xml_append_tabs(growbuf_t *out, int level) {
@@ -868,12 +896,17 @@ static char *generic_try_string(const unsigned char *decomp, size_t decomp_size,
     return out;
 }
 
-static void generic_push_child(generic_val_t **arr, int *count, generic_val_t v) {
-    generic_val_t *n = (generic_val_t *)realloc(*arr, sizeof(generic_val_t) * (size_t)(*count + 1));
-    if (!n) { generic_val_free(&v); return; }
-    *arr = n;
-    (*arr)[*count] = v;
-    (*count)++;
+/* Appends v to *arr, growing it geometrically (*cap = allocated slots) --
+   large structs have millions of slots, growing by one would be quadratic. */
+static void generic_push_child(generic_val_t **arr, int *count, int *cap, generic_val_t v) {
+    if (*count >= *cap) {
+        int new_cap = *cap ? *cap * 2 : 8;
+        generic_val_t *n = (generic_val_t *)realloc(*arr, sizeof(generic_val_t) * (size_t)new_cap);
+        if (!n) { generic_val_free(&v); return; }
+        *arr = n;
+        *cap = new_cap;
+    }
+    (*arr)[(*count)++] = v;
 }
 
 static generic_val_t generic_resolve_pointer(const unsigned char *decomp, size_t decomp_size,
@@ -895,6 +928,7 @@ static void generic_resolve_struct(const unsigned char *decomp, size_t decomp_si
                                     generic_val_t **out_children, int *out_count) {
     *out_children = NULL;
     *out_count = 0;
+    int out_cap = 0;
     if (depth > GENERIC_MAX_DEPTH || size == 0 || pool_index < 0 || pool_index >= pool_count) return;
     if (visited_contains(visited, visited_count, pool_index, offset)) return;
     if (visited_count < GENERIC_MAX_VISITED) { visited[visited_count].pool = pool_index; visited[visited_count].offset = offset; visited_count++; }
@@ -902,29 +936,36 @@ static void generic_resolve_struct(const unsigned char *decomp, size_t decomp_si
     uint32_t pool_start = pool_region_start + pools[pool_index].offset;
     uint32_t end = offset + size;
     uint32_t pos = offset;
+    /* Cursor over the sorted fragments of this pool, moving along with pos:
+       most slots have no link, so a binary search per slot is wasted. Where
+       the cursor sees one, find_link still picks it (same fragment as before). */
+    int cur = link_lower_bound(frags_sorted, frag_count, pool_index, offset);
     while (pos < end) {
-        const ovl_fragment_t *link = (pos + 8 <= end) ? find_link(frags_sorted, frag_count, pool_index, pos) : NULL;
+        while (cur < frag_count && frags_sorted[cur].link_pool == pool_index && frags_sorted[cur].link_offset < pos) cur++;
+        int linked = cur < frag_count && frags_sorted[cur].link_pool == pool_index && frags_sorted[cur].link_offset == pos;
+        const ovl_fragment_t *link = (linked && pos + 8 <= end) ? find_link(frags_sorted, frag_count, pool_index, pos) : NULL;
         if (link) {
             int32_t tpool = link->struct_pool;
             uint32_t toff = link->struct_offset;
             char *s = generic_try_string(decomp, decomp_size, pools, pool_count, pool_region_start, tpool, toff);
             if (s) {
                 generic_val_t v = {0}; v.kind = GV_STR; v.str = s;
-                generic_push_child(out_children, out_count, v);
+                generic_push_child(out_children, out_count, &out_cap, v);
             } else {
                 int run = 0;
                 uint32_t p = toff;
                 while (run < GENERIC_MAX_ARRAY && find_link(frags_sorted, frag_count, tpool, p)) { run++; p += 8; }
                 if (run >= 2) {
                     generic_val_t v = {0}; v.kind = GV_ARRAY;
+                    int v_cap = 0;
                     for (int i = 0; i < run; i++) {
                         const ovl_fragment_t *e = find_link(frags_sorted, frag_count, tpool, toff + (uint32_t)i * 8);
                         generic_val_t item = generic_resolve_pointer(decomp, decomp_size, pools, pool_count, pool_region_start,
                                                                       frags_sorted, frag_count, bounds, bounds_count,
                                                                       e->struct_pool, e->struct_offset, depth + 1, visited, visited_count);
-                        generic_push_child(&v.children, &v.child_count, item);
+                        generic_push_child(&v.children, &v.child_count, &v_cap, item);
                     }
-                    generic_push_child(out_children, out_count, v);
+                    generic_push_child(out_children, out_count, &out_cap, v);
                 } else {
                     uint32_t tsize = struct_size_at_generic(bounds, bounds_count, pools, pool_count, tpool, toff);
                     generic_val_t v = {0}; v.kind = GV_STRUCT;
@@ -932,14 +973,14 @@ static void generic_resolve_struct(const unsigned char *decomp, size_t decomp_si
                                             frags_sorted, frag_count, bounds, bounds_count,
                                             tpool, toff, tsize, depth + 1, visited, visited_count,
                                             &v.children, &v.child_count);
-                    generic_push_child(out_children, out_count, v);
+                    generic_push_child(out_children, out_count, &out_cap, v);
                 }
             }
             pos += 8;
         } else if (pos + 4 <= end) {
             uint32_t val; memcpy(&val, decomp + pool_start + pos, 4);
             generic_val_t v = {0}; v.kind = GV_RAW; v.raw = val;
-            generic_push_child(out_children, out_count, v);
+            generic_push_child(out_children, out_count, &out_cap, v);
             pos += 4;
         } else {
             pos = end;
@@ -966,9 +1007,26 @@ static generic_val_t generic_resolve_pointer(const unsigned char *decomp, size_t
 
 static void generic_render_slots(growbuf_t *out, const generic_val_t *slots, int count, const char *indent);
 
+/* child = indent + one tab (child holds 64 chars). */
+static void generic_child_indent(char *child, const char *indent) {
+    size_t n = strlen(indent);
+    if (n > 62) n = 62;
+    memcpy(child, indent, n);
+    child[n] = '\t';
+    child[n + 1] = '\0';
+}
+
+/* Appends prefix + "field<n>" + suffix, e.g. "<field3>" or "</field3>\n". */
+static void generic_append_field_tag(growbuf_t *out, const char *prefix, int n, const char *suffix) {
+    xml_append_str(out, prefix);
+    growbuf_append(out, (const unsigned char *)"field", 5);
+    growbuf_append_u32(out, (uint32_t)n);
+    xml_append_str(out, suffix);
+}
+
 static void generic_render_item(growbuf_t *out, const generic_val_t *item, const char *indent) {
     char child_indent[64];
-    _snprintf(child_indent, sizeof(child_indent) - 1, "%s\t", indent);
+    generic_child_indent(child_indent, indent);
     if (item->kind == GV_STR) {
         xml_append_str(out, indent); xml_append_str(out, "<item>");
         xml_append_escaped(out, item->str, 0);
@@ -990,9 +1048,11 @@ static void generic_render_item(growbuf_t *out, const generic_val_t *item, const
         for (int i = 0; i < item->child_count; i++) {
             if (item->children[i].kind != GV_RAW) continue;
             attr_i++;
-            char buf[48];
-            _snprintf(buf, sizeof(buf) - 1, " attr%d=\"%u\"", attr_i, item->children[i].raw);
-            xml_append_str(out, buf);
+            xml_append_str(out, " attr");
+            growbuf_append_u32(out, (uint32_t)attr_i);
+            xml_append_str(out, "=\"");
+            growbuf_append_u32(out, item->children[i].raw);
+            xml_append_str(out, "\"");
         }
         xml_append_str(out, ">");
         xml_append_escaped(out, the_str->str, 0);
@@ -1006,22 +1066,21 @@ static void generic_render_item(growbuf_t *out, const generic_val_t *item, const
 
 static void generic_render_slots(growbuf_t *out, const generic_val_t *slots, int count, const char *indent) {
     char child_indent[64];
-    _snprintf(child_indent, sizeof(child_indent) - 1, "%s\t", indent);
+    generic_child_indent(child_indent, indent);
     for (int i = 0; i < count; i++) {
         const generic_val_t *v = &slots[i];
-        char tag[24];
-        _snprintf(tag, sizeof(tag) - 1, "field%d", i + 1);
         switch (v->kind) {
-            case GV_RAW: {
-                char buf[64];
-                _snprintf(buf, sizeof(buf) - 1, "%s<%s>%u</%s>\n", indent, tag, v->raw, tag);
-                xml_append_str(out, buf);
+            case GV_RAW:
+                xml_append_str(out, indent);
+                generic_append_field_tag(out, "<", i + 1, ">");
+                growbuf_append_u32(out, v->raw);
+                generic_append_field_tag(out, "</", i + 1, ">\n");
                 break;
-            }
             case GV_STR:
-                xml_append_str(out, indent); xml_append_str(out, "<"); xml_append_str(out, tag); xml_append_str(out, ">");
+                xml_append_str(out, indent);
+                generic_append_field_tag(out, "<", i + 1, ">");
                 xml_append_escaped(out, v->str, 0);
-                xml_append_str(out, "</"); xml_append_str(out, tag); xml_append_str(out, ">\n");
+                generic_append_field_tag(out, "</", i + 1, ">\n");
                 break;
             case GV_ARRAY: {
                 char buf[48];
@@ -1032,9 +1091,11 @@ static void generic_render_slots(growbuf_t *out, const generic_val_t *slots, int
                 break;
             }
             case GV_STRUCT:
-                xml_append_str(out, indent); xml_append_str(out, "<"); xml_append_str(out, tag); xml_append_str(out, ">\n");
+                xml_append_str(out, indent);
+                generic_append_field_tag(out, "<", i + 1, ">\n");
                 generic_render_slots(out, v->children, v->child_count, child_indent);
-                xml_append_str(out, indent); xml_append_str(out, "</"); xml_append_str(out, tag); xml_append_str(out, ">\n");
+                xml_append_str(out, indent);
+                generic_append_field_tag(out, "</", i + 1, ">\n");
                 break;
         }
     }

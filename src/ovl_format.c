@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <limits.h>
 
 /* Upper bound guarding against malicious/corrupt headers with huge counts
    (overflow protection). */
@@ -612,27 +613,39 @@ int ovl_parse_buffer_groups(const unsigned char *decomp, size_t decomp_size,
     return 1;
 }
 
-/* Internal: dynamic set of unique uint64 offsets per pool (sorted insert). */
+/* Internal: an offset known in one pool. idx is the RootEntry's index for a
+   RootEntry offset, INT_MAX for a Fragment target (boundary only). */
 typedef struct {
-    uint64_t *vals;
+    uint64_t offset;
+    int idx;
+} ovl_pool_offset_t;
+
+/* Internal: all offsets of one pool, collected unsorted (duplicates
+   included) and sorted once by (offset, idx) -- the first element of a run
+   of equal offsets is then the first RootEntry in table order, if any. */
+typedef struct {
+    ovl_pool_offset_t *vals;
     int count, capacity;
 } ovl_offset_set_t;
 
-static void offset_set_add(ovl_offset_set_t *s, uint64_t v) {
-    for (int i = 0; i < s->count; i++) if (s->vals[i] == v) return;
+static void offset_set_add(ovl_offset_set_t *s, uint64_t offset, int idx) {
     if (s->count >= s->capacity) {
         int new_cap = s->capacity ? s->capacity * 2 : 8;
-        uint64_t *n = (uint64_t *)realloc(s->vals, (size_t)new_cap * sizeof(uint64_t));
+        ovl_pool_offset_t *n = (ovl_pool_offset_t *)realloc(s->vals, (size_t)new_cap * sizeof(ovl_pool_offset_t));
         if (!n) return;
         s->vals = n;
         s->capacity = new_cap;
     }
-    s->vals[s->count++] = v;
+    s->vals[s->count].offset = offset;
+    s->vals[s->count].idx = idx;
+    s->count++;
 }
 
-static int cmp_u64(const void *a, const void *b) {
-    uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
-    return (x > y) - (x < y);
+static int cmp_pool_offset(const void *a, const void *b) {
+    const ovl_pool_offset_t *x = (const ovl_pool_offset_t *)a;
+    const ovl_pool_offset_t *y = (const ovl_pool_offset_t *)b;
+    if (x->offset != y->offset) return (x->offset > y->offset) - (x->offset < y->offset);
+    return (x->idx > y->idx) - (x->idx < y->idx);
 }
 
 int ovl_resolve_pool_sub_files(const ovl_pool_t *pools, int pool_count,
@@ -649,13 +662,13 @@ int ovl_resolve_pool_sub_files(const ovl_pool_t *pools, int pool_count,
     for (int i = 0; i < root_count; i++) {
         int32_t pidx = root_entries[i].pool_index;
         if (pidx >= 0 && pidx < pool_count) {
-            offset_set_add(&sets[pidx], root_entries[i].data_offset);
+            offset_set_add(&sets[pidx], root_entries[i].data_offset, i);
         }
     }
     for (int i = 0; i < fragment_count; i++) {
         int32_t pidx = fragments[i].struct_pool;
         if (pidx >= 0 && pidx < pool_count && fragments[i].struct_offset != pools[pidx].size) {
-            offset_set_add(&sets[pidx], fragments[i].struct_offset);
+            offset_set_add(&sets[pidx], fragments[i].struct_offset, INT_MAX);
         }
     }
 
@@ -665,26 +678,20 @@ int ovl_resolve_pool_sub_files(const ovl_pool_t *pools, int pool_count,
 
     for (int p = 0; p < pool_count; p++) {
         if (sets[p].count == 0) continue;
-        qsort(sets[p].vals, (size_t)sets[p].count, sizeof(uint64_t), cmp_u64);
+        qsort(sets[p].vals, (size_t)sets[p].count, sizeof(ovl_pool_offset_t), cmp_pool_offset);
 
-        for (int j = 0; j < sets[p].count; j++) {
-            uint64_t o = sets[p].vals[j];
-            uint64_t next = (j + 1 < sets[p].count) ? sets[p].vals[j + 1] : pools[p].size;
+        for (int j = 0; j < sets[p].count; ) {
+            const ovl_pool_offset_t *first = &sets[p].vals[j];
+            uint64_t o = first->offset;
+            while (j < sets[p].count && sets[p].vals[j].offset == o) j++;
+            uint64_t next = (j < sets[p].count) ? sets[p].vals[j].offset : pools[p].size;
             if (next <= o) continue;
 
             /* Only emit entries that have an associated file_hash (from a
                RootEntry) -- Fragment-only offsets just refine boundaries. */
-            int found = 0;
-            uint32_t fh = 0, eh = 0;
-            for (int i = 0; i < root_count; i++) {
-                if (root_entries[i].pool_index == p && root_entries[i].data_offset == o) {
-                    found = 1;
-                    fh = root_entries[i].file_hash;
-                    eh = root_entries[i].ext_hash;
-                    break;
-                }
-            }
-            if (!found) continue;
+            if (first->idx == INT_MAX) continue;
+            uint32_t fh = root_entries[first->idx].file_hash;
+            uint32_t eh = root_entries[first->idx].ext_hash;
 
             if (count >= cap) {
                 cap *= 2;
